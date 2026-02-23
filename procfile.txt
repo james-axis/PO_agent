@@ -1,0 +1,1 @@
+worker: python jira_scheduler.py
