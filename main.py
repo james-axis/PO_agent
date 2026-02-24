@@ -92,6 +92,65 @@ def create_sprint(name, start_date, end_date):
         log.error(f"Failed to create sprint: {res.status_code} {res.text}")
         return None
 
+def close_sprint(sprint_id):
+    res = requests.post(f"{JIRA_BASE_URL}/rest/agile/1.0/sprint/{sprint_id}", auth=auth, headers=headers, json={"state": "closed"})
+    return res.status_code in (200, 204)
+
+def start_sprint(sprint):
+    res = requests.post(f"{JIRA_BASE_URL}/rest/agile/1.0/sprint/{sprint['id']}", auth=auth, headers=headers, json={
+        "state": "active",
+        "startDate": sprint["startDate"],
+        "endDate": sprint["endDate"]
+    })
+    return res.status_code in (200, 204)
+
+def get_incomplete_issues(sprint_id):
+    """Get issues from a sprint that are not Done or Released."""
+    issues = get_sprint_issues(sprint_id)
+    return [i for i in issues if i["fields"]["status"]["name"] not in ("Done", "Released")]
+
+def manage_sprint_lifecycle():
+    """Close expired active sprints, carry over incomplete issues, and start the next sprint."""
+    sydney_tz = pytz.timezone("Australia/Sydney")
+    today = datetime.now(sydney_tz).date()
+
+    active_sprints = get_active_sprint()
+    carryover_issues = []
+
+    for sprint in active_sprints:
+        end_date = datetime.strptime(sprint["endDate"][:10], "%Y-%m-%d").date()
+        if end_date <= today:
+            # Collect incomplete issues before closing
+            incomplete = get_incomplete_issues(sprint["id"])
+            if incomplete:
+                carryover_issues.extend(incomplete)
+                log.info(f"Found {len(incomplete)} incomplete issue(s) in sprint '{sprint['name']}' to carry over.")
+
+            if close_sprint(sprint["id"]):
+                log.info(f"Closed sprint '{sprint['name']}' (ended {end_date}).")
+            else:
+                log.error(f"Failed to close sprint '{sprint['name']}'.")
+
+    # Re-check: if no active sprint now, start the next future one
+    if not get_active_sprint():
+        future = get_future_sprints()
+        if future:
+            next_sprint = future[0]
+            if start_sprint(next_sprint):
+                log.info(f"Started sprint '{next_sprint['name']}'.")
+
+                # Move carryover issues into the new active sprint
+                for issue in carryover_issues:
+                    key = issue["key"]
+                    if move_issue_to_sprint(key, next_sprint["id"]):
+                        log.info(f"Carried over {key} to sprint '{next_sprint['name']}'.")
+                    else:
+                        log.warning(f"Failed to carry over {key}.")
+            else:
+                log.error(f"Failed to start sprint '{next_sprint['name']}'.")
+        else:
+            log.warning("No future sprints available to start.")
+
 def ensure_sprint_runway(future_sprints, required=8):
     if len(future_sprints) >= required:
         log.info(f"Sprint runway OK — {len(future_sprints)} future sprints exist.")
@@ -114,6 +173,10 @@ def ensure_sprint_runway(future_sprints, required=8):
 def run():
     log.info("=== Starting Jira prioritisation run ===")
     try:
+        # JOB 0: Sprint lifecycle (close expired, start next)
+        log.info("JOB 0: Sprint Lifecycle")
+        manage_sprint_lifecycle()
+
         # JOB 1: Sprint runway
         log.info("JOB 1: Sprint Runway")
         future_sprints = get_future_sprints()
