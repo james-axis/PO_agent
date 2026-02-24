@@ -6,6 +6,8 @@ from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.cron import CronTrigger
 import pytz
 
+import re
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
@@ -14,6 +16,7 @@ JIRA_EMAIL     = os.getenv("JIRA_EMAIL")
 JIRA_API_TOKEN = os.getenv("JIRA_API_TOKEN")
 BOARD_ID       = os.getenv("JIRA_BOARD_ID", "1")
 ANDREJ_ID      = os.getenv("ANDREJ_ID", "712020:00983fc3-e82b-470b-b141-77804c9be677")
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 
 MAX_SPRINT_POINTS = 40
 PRIORITY_ORDER    = {"Highest": 1, "High": 2, "Medium": 3, "Low": 4, "Lowest": 5}
@@ -172,6 +175,217 @@ def ensure_sprint_runway(future_sprints, required=8):
     future_sprints.sort(key=lambda s: s["startDate"])
     return future_sprints
 
+TEMPLATE_MARKER = "**Product Manager:**"
+DOR_DOD_LINK = '[**Definition of Ready (DoR) - Task Level**](https://axiscrm.atlassian.net/wiki/spaces/CAD/pages/91062273/Delivery+process#Definition-of-Ready-(DoR))   **|**   [**Definition of Done (DoD) - Task Level**](https://axiscrm.atlassian.net/wiki/spaces/CAD/pages/91062273/Delivery+process#Definition-of-Done-(DoD))'
+
+def get_tasks_needing_enrichment():
+    """Get all non-completed Task issues that don't yet have the full template."""
+    jql = 'project = AX AND issuetype = Task AND status not in (Done, Released) ORDER BY rank ASC'
+    params = {"jql": jql, "fields": "summary,description,priority,customfield_10016,status,parent", "maxResults": 100}
+    res = requests.get(f"{JIRA_BASE_URL}/rest/api/3/search/jql", auth=auth, headers=headers, params=params)
+    res.raise_for_status()
+    issues = res.json().get("issues", [])
+    # Filter to only those missing the full template
+    return [i for i in issues if not description_has_template(i["fields"].get("description") or "")]
+
+def description_has_template(desc):
+    """Check if description already contains the full enriched template."""
+    return TEMPLATE_MARKER in desc and "User story:" in desc and "Test plan:" in desc and "Technical plan:" in desc
+
+def extract_existing_content(desc):
+    """Pull out any existing summary, acceptance criteria, or other content from the current description."""
+    # Strip out DoR/DoD links and image blobs for cleaner extraction
+    cleaned = re.sub(r'\[?\*?\*?Definition of.*$', '', desc, flags=re.DOTALL)
+    cleaned = re.sub(r'!\[.*?\]\(blob:.*?\)', '[image attached]', cleaned)
+    return cleaned.strip()
+
+def call_claude_for_enrichment(summary, existing_description, story_points, priority, parent_summary):
+    """Call Claude API to generate the enriched description fields."""
+    if not ANTHROPIC_API_KEY:
+        log.warning("ANTHROPIC_API_KEY not set — skipping enrichment.")
+        return None
+
+    existing_content = extract_existing_content(existing_description)
+    sp_text = str(story_points) if story_points else "Not yet estimated"
+    broken_down = "Yes" if story_points and story_points <= 3 else "No" if story_points else "Not yet estimated"
+
+    prompt = f"""You are a Product Owner for a Life Insurance distribution CRM platform (Axis CRM).
+The platform is used by insurance advisers to manage clients, policies, applications, quotes, payments and commissions.
+Partner insurers include TAL, Zurich, AIA, MLC Life, MetLife, Resolution Life, Integrity Life and others.
+
+Given the following Jira Task, generate the enriched description fields. Be concise and specific to THIS task.
+Use the existing content as the primary source — preserve and improve it, don't discard it.
+
+TASK SUMMARY: {summary}
+PARENT EPIC: {parent_summary or 'None'}
+PRIORITY: {priority}
+STORY POINTS: {sp_text}
+EXISTING DESCRIPTION:
+{existing_content}
+
+Respond in EXACTLY this format (no extra text before or after):
+
+SUMMARY: <1-2 sentence summary of what this task delivers>
+USER_STORY: <As a [role], I want [action], so that [benefit]>
+ACCEPTANCE_CRITERIA: <bullet points, one per line, starting with "- ">
+TEST_PLAN: <numbered steps to verify the acceptance criteria are met>
+TECHNICAL_PLAN: <brief technical approach — mention relevant components, APIs, DB tables if inferrable. If unsure, write "To be completed by engineer during refinement.">
+"""
+
+    res = requests.post(
+        "https://api.anthropic.com/v1/messages",
+        headers={
+            "x-api-key": ANTHROPIC_API_KEY,
+            "anthropic-version": "2023-06-01",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": "claude-sonnet-4-20250514",
+            "max_tokens": 1024,
+            "messages": [{"role": "user", "content": prompt}],
+        },
+        timeout=30,
+    )
+
+    if res.status_code != 200:
+        log.error(f"Claude API error: {res.status_code} {res.text}")
+        return None
+
+    text = res.json()["content"][0]["text"].strip()
+    return parse_claude_response(text, story_points)
+
+def parse_claude_response(text, story_points):
+    """Parse the structured response from Claude into a dict."""
+    fields = {}
+    patterns = {
+        "summary": r"SUMMARY:\s*(.+?)(?=\nUSER_STORY:)",
+        "user_story": r"USER_STORY:\s*(.+?)(?=\nACCEPTANCE_CRITERIA:)",
+        "acceptance_criteria": r"ACCEPTANCE_CRITERIA:\s*(.+?)(?=\nTEST_PLAN:)",
+        "test_plan": r"TEST_PLAN:\s*(.+?)(?=\nTECHNICAL_PLAN:)",
+        "technical_plan": r"TECHNICAL_PLAN:\s*(.+)",
+    }
+    for key, pattern in patterns.items():
+        match = re.search(pattern, text, re.DOTALL)
+        fields[key] = match.group(1).strip() if match else ""
+
+    sp_text = str(story_points) if story_points else "Not yet estimated"
+    broken_down = "Yes" if story_points and story_points <= 3 else ("No — needs splitting" if story_points and story_points > 3 else "Not yet estimated")
+    fields["story_points_text"] = sp_text
+    fields["broken_down"] = broken_down
+    return fields
+
+def build_enriched_description(fields):
+    """Build the final markdown description from the enriched fields."""
+    ac_lines = fields["acceptance_criteria"]
+    # Convert bullet points to checkbox format
+    ac_formatted = re.sub(r'^- ', '- [ ] ', ac_lines, flags=re.MULTILINE)
+
+    return f"""**Product Manager:**
+1. **Summary:** {fields['summary']}
+2. **User story:** {fields['user_story']}
+3. **Acceptance criteria:**
+{ac_formatted}
+4. **Test plan:**
+{fields['test_plan']}
+
+**Engineer:**
+1. **Technical plan:** {fields['technical_plan']}
+2. **Story points estimated:** {fields['story_points_text']}
+3. **Task broken down (<=3 story points or split into parts):** {fields['broken_down']}
+
+{DOR_DOD_LINK}"""
+
+def update_issue_description(issue_key, new_description):
+    """Update the description of a Jira issue using the v3 API with ADF."""
+    # Build ADF from markdown — use the wiki markup approach via v2 API
+    res = requests.put(
+        f"{JIRA_BASE_URL}/rest/api/3/issue/{issue_key}",
+        auth=auth,
+        headers=headers,
+        json={
+            "update": {
+                "description": [{
+                    "set": {
+                        "version": 1,
+                        "type": "doc",
+                        "content": markdown_to_adf(new_description)
+                    }
+                }]
+            }
+        },
+    )
+    return res.status_code in (200, 204)
+
+def markdown_to_adf(md_text):
+    """Convert simple markdown to ADF content nodes."""
+    content = []
+    lines = md_text.split("\n")
+    for line in lines:
+        line = line.rstrip()
+        if not line:
+            continue
+
+        # Convert inline bold **text** to ADF marks
+        inline_content = parse_inline_marks(line)
+        content.append({"type": "paragraph", "content": inline_content})
+
+    return content
+
+def parse_inline_marks(text):
+    """Parse inline markdown bold and links into ADF inline nodes."""
+    nodes = []
+    # Pattern to match **bold**, [text](url), and plain text
+    pattern = r'(\*\*(.+?)\*\*|\[(.+?)\]\((.+?)\)|[^*\[]+)'
+    for match in re.finditer(pattern, text):
+        full = match.group(0)
+        if match.group(2):  # Bold
+            nodes.append({"type": "text", "text": match.group(2), "marks": [{"type": "strong"}]})
+        elif match.group(3) and match.group(4):  # Link
+            nodes.append({"type": "text", "text": match.group(3), "marks": [{"type": "link", "attrs": {"href": match.group(4)}}]})
+        else:  # Plain text
+            if full.strip():
+                nodes.append({"type": "text", "text": full})
+    if not nodes:
+        nodes.append({"type": "text", "text": text})
+    return nodes
+
+def enrich_ticket_descriptions():
+    """JOB 5: Enrich Task descriptions to match the standard template."""
+    if not ANTHROPIC_API_KEY:
+        log.info("JOB 5 skipped — ANTHROPIC_API_KEY not set.")
+        return
+
+    tasks = get_tasks_needing_enrichment()
+    if not tasks:
+        log.info("No tasks need enrichment.")
+        return
+
+    log.info(f"Found {len(tasks)} task(s) needing enrichment.")
+
+    for issue in tasks:
+        key = issue["key"]
+        fields = issue["fields"]
+        summary = fields["summary"]
+        description = fields.get("description") or ""
+        story_points = fields.get("customfield_10016")
+        priority = fields.get("priority", {}).get("name", "Medium")
+        parent_summary = ""
+        if fields.get("parent"):
+            parent_summary = fields["parent"].get("fields", {}).get("summary", "")
+
+        log.info(f"Enriching {key}: {summary}")
+
+        enriched = call_claude_for_enrichment(summary, description, story_points, priority, parent_summary)
+        if not enriched:
+            log.warning(f"Skipping {key} — enrichment failed.")
+            continue
+
+        new_desc = build_enriched_description(enriched)
+        if update_issue_description(key, new_desc):
+            log.info(f"Updated {key} with enriched description.")
+        else:
+            log.warning(f"Failed to update {key}.")
+
 def run():
     log.info("=== Starting Jira prioritisation run ===")
     try:
@@ -225,6 +439,10 @@ def run():
         backlog_all = get_backlog_issues()
         if backlog_all:
             rank_issues(backlog_all, "Backlog")
+
+        # JOB 5: Enrich ticket descriptions
+        log.info("JOB 5: Enrich Ticket Descriptions")
+        enrich_ticket_descriptions()
 
         log.info("=== Run complete ===")
 
