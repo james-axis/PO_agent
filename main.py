@@ -195,7 +195,7 @@ def parse_inline_marks(text):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def get_unreviewed_issues():
-    jql = 'project = AX AND Reviewed is EMPTY AND status not in (Done, Released) ORDER BY rank ASC'
+    jql = 'project = AX AND (Reviewed is EMPTY OR Reviewed = "Partially") AND status not in (Done, Released) ORDER BY rank ASC'
     field_list = f"summary,description,issuetype,priority,status,parent,issuelinks,attachment,{STORY_POINTS_FIELD},{REVIEWED_FIELD},sprint"
     issues, start_at = [], 0
     while True:
@@ -498,15 +498,16 @@ def build_description_markdown(issue_type, enrichment):
 {DOR_DOD_TASK}"""
 
 
-def update_issue_fields(issue_key, summary=None, description_md=None, story_points=None, set_reviewed=True):
+def update_issue_fields(issue_key, summary=None, description_md=None, story_points=None, reviewed_value="Yes"):
+    """Update an issue. reviewed_value can be 'Yes', 'Partially', or None to skip."""
     payload = {"fields": {}, "update": {}}
 
     if summary:
         payload["fields"]["summary"] = summary
     if story_points is not None:
         payload["fields"][STORY_POINTS_FIELD] = float(story_points)
-    if set_reviewed:
-        payload["fields"][REVIEWED_FIELD] = [{"value": "Yes"}]
+    if reviewed_value:
+        payload["fields"][REVIEWED_FIELD] = [{"value": reviewed_value}]
     if description_md:
         payload["update"]["description"] = [{"set": {"version": 1, "type": "doc", "content": markdown_to_adf(description_md)}}]
 
@@ -580,6 +581,42 @@ def create_split_ticket(original_issue, split_data, issue_type):
         return None
 
 
+def assess_completeness(issue_type, enrichment, story_points):
+    """Determine if enrichment is fully complete ('Yes') or only partial ('Partially').
+    Returns 'Yes' if all PM fields have real content, 'Partially' otherwise."""
+    def has_value(val):
+        if val is None:
+            return False
+        if isinstance(val, str):
+            return val.strip() not in ("", "N/A", "TBD", "Not set")
+        if isinstance(val, list):
+            return len(val) > 0 and all(has_value(v) for v in val)
+        return True
+
+    if issue_type == "Epic":
+        checks = [
+            has_value(enrichment.get("pm_summary")),
+            has_value(enrichment.get("validated")),
+            has_value(enrichment.get("rice_score")),
+            has_value(enrichment.get("prd")),
+        ]
+    elif issue_type == "Task":
+        checks = [
+            has_value(enrichment.get("pm_summary")),
+            has_value(enrichment.get("user_story")),
+            has_value(enrichment.get("acceptance_criteria")),
+            has_value(enrichment.get("test_plan")),
+            story_points is not None,
+        ]
+    else:  # Bug, Maintenance, Spike, Support
+        checks = [
+            has_value(enrichment.get("pm_summary")),
+            story_points is not None,
+        ]
+
+    return "Yes" if all(checks) else "Partially"
+
+
 def enrich_ticket_descriptions():
     if not ANTHROPIC_API_KEY:
         log.info("JOB 5 skipped — ANTHROPIC_API_KEY not set.")
@@ -600,7 +637,7 @@ def enrich_ticket_descriptions():
 
         if issue_type not in SUPPORTED_TYPES:
             log.info(f"  Skipping {key} — unsupported type '{issue_type}', marking reviewed.")
-            update_issue_fields(key, set_reviewed=True)
+            update_issue_fields(key, reviewed_value="Yes")
             continue
 
         log.info(f"  Enriching {key} ({issue_type}): {summary}")
@@ -681,10 +718,11 @@ Verify all split tickets pass their individual test plans.
 {DOR_DOD_TASK}"""
 
             update_issue_fields(key, summary=f"[SPLIT] {polished_summary}", description_md=split_desc,
-                story_points=0 if issue_type != "Epic" else None, set_reviewed=True)
+                story_points=0 if issue_type != "Epic" else None, reviewed_value="Yes")
         else:
+            reviewed = assess_completeness(issue_type, enrichment, new_sp)
             update_issue_fields(key, summary=polished_summary, description_md=new_desc,
-                story_points=new_sp, set_reviewed=True)
+                story_points=new_sp, reviewed_value=reviewed)
 
         log.info(f"  Completed {key}.")
 
