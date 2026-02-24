@@ -1,4 +1,6 @@
 import os
+import re
+import json
 import requests
 import logging
 from datetime import datetime, timedelta
@@ -6,66 +8,73 @@ from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.cron import CronTrigger
 import pytz
 
-import re
-
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
-JIRA_BASE_URL  = os.getenv("JIRA_BASE_URL", "https://axiscrm.atlassian.net")
-JIRA_EMAIL     = os.getenv("JIRA_EMAIL")
-JIRA_API_TOKEN = os.getenv("JIRA_API_TOKEN")
-BOARD_ID       = os.getenv("JIRA_BOARD_ID", "1")
-ANDREJ_ID      = os.getenv("ANDREJ_ID", "712020:00983fc3-e82b-470b-b141-77804c9be677")
+# ── Config ────────────────────────────────────────────────────────────────────
+JIRA_BASE_URL     = os.getenv("JIRA_BASE_URL", "https://axiscrm.atlassian.net")
+JIRA_EMAIL        = os.getenv("JIRA_EMAIL")
+JIRA_API_TOKEN    = os.getenv("JIRA_API_TOKEN")
+BOARD_ID          = os.getenv("JIRA_BOARD_ID", "1")
+ANDREJ_ID         = os.getenv("ANDREJ_ID", "712020:00983fc3-e82b-470b-b141-77804c9be677")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+CONFLUENCE_BASE   = f"{JIRA_BASE_URL}/wiki"
 
-MAX_SPRINT_POINTS = 40
-PRIORITY_ORDER    = {"Highest": 1, "High": 2, "Medium": 3, "Low": 4, "Lowest": 5}
+MAX_SPRINT_POINTS  = 40
+PRIORITY_ORDER     = {"Highest": 1, "High": 2, "Medium": 3, "Low": 4, "Lowest": 5}
+COMPLETED_STATUSES = {"done", "released"}
+STORY_POINTS_FIELD = "customfield_10016"
+REVIEWED_FIELD     = "customfield_10128"
 
 auth    = (JIRA_EMAIL, JIRA_API_TOKEN)
 headers = {"Accept": "application/json", "Content-Type": "application/json"}
 
+DOR_DOD_TASK = '[**Definition of Ready (DoR) - Task Level**](https://axiscrm.atlassian.net/wiki/spaces/CAD/pages/91062273/Delivery+process#Definition-of-Ready-(DoR))   **|**   [**Definition of Done (DoD) - Task Level**](https://axiscrm.atlassian.net/wiki/spaces/CAD/pages/91062273/Delivery+process#Definition-of-Done-(DoD))'
+DOR_DOD_EPIC = '[**Definition of Ready (DoR) - Epic Level**](https://axiscrm.atlassian.net/wiki/spaces/CAD/pages/91062273/Delivery+process#Definition-of-Ready-(DoR))   **|**   [**Definition of Done (DoD) - Epic Level**](https://axiscrm.atlassian.net/wiki/spaces/CAD/pages/91062273/Delivery+process#Definition-of-Done-(DoD))'
+
+SUPPORTED_TYPES = {"Epic", "Task", "Bug", "Maintenance", "Spike", "Support"}
+
+# ── Jira helpers ──────────────────────────────────────────────────────────────
+
+def jira_get(path, params=None):
+    r = requests.get(f"{JIRA_BASE_URL}{path}", auth=auth, headers=headers, params=params)
+    r.raise_for_status()
+    return r.json()
+
+def jira_put(path, payload):
+    r = requests.put(f"{JIRA_BASE_URL}{path}", auth=auth, headers=headers, json=payload)
+    return r.status_code in (200, 204), r
+
+def jira_post(path, payload):
+    r = requests.post(f"{JIRA_BASE_URL}{path}", auth=auth, headers=headers, json=payload)
+    return r.status_code in (200, 201, 204), r
+
 def get_active_sprint():
-    res = requests.get(f"{JIRA_BASE_URL}/rest/agile/1.0/board/{BOARD_ID}/sprint?state=active", auth=auth, headers=headers)
-    res.raise_for_status()
-    return res.json().get("values", [])
+    return jira_get(f"/rest/agile/1.0/board/{BOARD_ID}/sprint?state=active").get("values", [])
 
 def get_future_sprints():
-    res = requests.get(f"{JIRA_BASE_URL}/rest/agile/1.0/board/{BOARD_ID}/sprint?state=future", auth=auth, headers=headers)
-    res.raise_for_status()
-    sprints = res.json().get("values", [])
+    sprints = jira_get(f"/rest/agile/1.0/board/{BOARD_ID}/sprint?state=future").get("values", [])
     sprints.sort(key=lambda s: s["startDate"])
     return sprints
 
 def get_sprint_issues(sprint_id):
-    res = requests.get(f"{JIRA_BASE_URL}/rest/agile/1.0/sprint/{sprint_id}/issue", auth=auth, headers=headers, params={"fields": "summary,priority,status", "maxResults": 200})
-    res.raise_for_status()
-    return res.json().get("issues", [])
+    return jira_get(f"/rest/agile/1.0/sprint/{sprint_id}/issue", params={"fields": "summary,priority,status", "maxResults": 200}).get("issues", [])
 
 def get_sprint_todo_points(sprint_id):
-    total = 0
-    for i in get_sprint_issues(sprint_id):
-        if i["fields"]["status"]["name"] == "To Do":
-            total += i["fields"].get("customfield_10016") or 0
-    return total
+    return sum((i["fields"].get(STORY_POINTS_FIELD) or 0) for i in get_sprint_issues(sprint_id) if i["fields"]["status"]["name"] == "To Do")
 
 def get_andrej_ready_backlog():
-    jql    = f'project = AX AND (sprint is EMPTY OR sprint in closedSprints()) AND status = Ready AND status != Released AND assignee = "{ANDREJ_ID}" AND cf[10016] is not EMPTY'
-    params = {"jql": jql, "fields": "summary,priority,customfield_10016", "maxResults": 200}
-    res    = requests.get(f"{JIRA_BASE_URL}/rest/api/3/search/jql", auth=auth, headers=headers, params=params)
-    res.raise_for_status()
-    issues = res.json().get("issues", [])
+    jql = f'project = AX AND (sprint is EMPTY OR sprint in closedSprints()) AND status = Ready AND status != Released AND assignee = "{ANDREJ_ID}" AND cf[10016] is not EMPTY'
+    issues = jira_get("/rest/api/3/search/jql", params={"jql": jql, "fields": "summary,priority,customfield_10016", "maxResults": 200}).get("issues", [])
     issues.sort(key=lambda i: PRIORITY_ORDER.get(i["fields"]["priority"]["name"], 999))
     return issues
 
 def get_backlog_issues():
-    params = {"jql": "project = AX AND (sprint is EMPTY OR sprint in closedSprints()) AND status != Released AND status != Done", "fields": "summary,priority,status,customfield_10020", "maxResults": 200}
-    res    = requests.get(f"{JIRA_BASE_URL}/rest/api/3/search/jql", auth=auth, headers=headers, params=params)
-    res.raise_for_status()
-    return res.json().get("issues", [])
+    return jira_get("/rest/api/3/search/jql", params={"jql": "project = AX AND (sprint is EMPTY OR sprint in closedSprints()) AND status != Released AND status != Done", "fields": "summary,priority,status,customfield_10020", "maxResults": 200}).get("issues", [])
 
 def move_issue_to_sprint(issue_key, sprint_id):
-    res = requests.post(f"{JIRA_BASE_URL}/rest/agile/1.0/sprint/{sprint_id}/issue", auth=auth, headers=headers, json={"issues": [issue_key]})
-    return res.status_code in (200, 204)
+    ok, _ = jira_post(f"/rest/agile/1.0/sprint/{sprint_id}/issue", {"issues": [issue_key]})
+    return ok
 
 def rank_issues(issues, label):
     if len(issues) < 2:
@@ -75,392 +84,626 @@ def rank_issues(issues, label):
     keys = [i["key"] for i in issues]
     log.info(f"{label} — ranking {len(keys)} issues")
     for idx in range(len(keys) - 2, -1, -1):
-        res = requests.put(f"{JIRA_BASE_URL}/rest/agile/1.0/issue/rank", auth=auth, headers=headers, json={"issues": [keys[idx]], "rankBeforeIssue": keys[idx + 1]})
-        if res.status_code not in (200, 204):
-            log.warning(f"Failed ranking {keys[idx]}: {res.status_code} {res.text}")
+        ok, r = jira_put("/rest/agile/1.0/issue/rank", {"issues": [keys[idx]], "rankBeforeIssue": keys[idx + 1]})
+        if not ok:
+            log.warning(f"Failed ranking {keys[idx]}: {r.status_code}")
 
 def next_tuesday(dt):
-    days_ahead = (1 - dt.weekday()) % 7
-    if days_ahead == 0:
-        days_ahead = 7
-    return dt + timedelta(days=days_ahead)
+    days = (1 - dt.weekday()) % 7
+    return dt + timedelta(days=days if days else 7)
 
-def create_sprint(name, start_date, end_date):
-    res = requests.post(f"{JIRA_BASE_URL}/rest/agile/1.0/sprint", auth=auth, headers=headers, json={"name": name, "startDate": start_date.strftime("%Y-%m-%dT00:00:00.000Z"), "endDate": end_date.strftime("%Y-%m-%dT00:00:00.000Z"), "originBoardId": int(BOARD_ID)})
-    if res.status_code in (200, 201):
-        sprint = res.json()
-        log.info(f"Created sprint '{name}' (id: {sprint['id']})")
-        return sprint
-    else:
-        log.error(f"Failed to create sprint: {res.status_code} {res.text}")
-        return None
+def create_sprint(name, start, end):
+    ok, r = jira_post("/rest/agile/1.0/sprint", {"name": name, "startDate": start.strftime("%Y-%m-%dT00:00:00.000Z"), "endDate": end.strftime("%Y-%m-%dT00:00:00.000Z"), "originBoardId": int(BOARD_ID)})
+    if ok:
+        s = r.json()
+        log.info(f"Created sprint '{name}' (id: {s['id']})")
+        return s
+    log.error(f"Failed to create sprint: {r.status_code} {r.text}")
+    return None
 
-def close_sprint(sprint_id):
-    res = requests.post(f"{JIRA_BASE_URL}/rest/agile/1.0/sprint/{sprint_id}", auth=auth, headers=headers, json={"state": "closed"})
-    return res.status_code in (200, 204)
+def close_sprint(sid):
+    ok, _ = jira_post(f"/rest/agile/1.0/sprint/{sid}", {"state": "closed"})
+    return ok
 
 def start_sprint(sprint):
-    res = requests.post(f"{JIRA_BASE_URL}/rest/agile/1.0/sprint/{sprint['id']}", auth=auth, headers=headers, json={
-        "state": "active",
-        "startDate": sprint["startDate"],
-        "endDate": sprint["endDate"]
-    })
-    return res.status_code in (200, 204)
-
-COMPLETED_STATUSES = {"done", "released"}
+    ok, _ = jira_post(f"/rest/agile/1.0/sprint/{sprint['id']}", {"state": "active", "startDate": sprint["startDate"], "endDate": sprint["endDate"]})
+    return ok
 
 def get_incomplete_issues(sprint_id):
-    """Get issues from a sprint that are not Done or Released."""
-    issues = get_sprint_issues(sprint_id)
-    return [i for i in issues if i["fields"]["status"]["name"].lower() not in COMPLETED_STATUSES]
+    return [i for i in get_sprint_issues(sprint_id) if i["fields"]["status"]["name"].lower() not in COMPLETED_STATUSES]
+
+# ── JOB 0: Sprint Lifecycle ──────────────────────────────────────────────────
 
 def manage_sprint_lifecycle():
-    """Close expired active sprints, carry over incomplete issues, and start the next sprint."""
     sydney_tz = pytz.timezone("Australia/Sydney")
     today = datetime.now(sydney_tz).date()
-
-    active_sprints = get_active_sprint()
-    carryover_issues = []
-
-    for sprint in active_sprints:
-        end_date = datetime.strptime(sprint["endDate"][:10], "%Y-%m-%d").date()
-        if end_date <= today:
-            # Collect incomplete issues before closing
+    carryover = []
+    for sprint in get_active_sprint():
+        end = datetime.strptime(sprint["endDate"][:10], "%Y-%m-%d").date()
+        if end <= today:
             incomplete = get_incomplete_issues(sprint["id"])
             if incomplete:
-                carryover_issues.extend(incomplete)
-                log.info(f"Found {len(incomplete)} incomplete issue(s) in sprint '{sprint['name']}' to carry over.")
-
+                carryover.extend(incomplete)
+                log.info(f"Found {len(incomplete)} incomplete issue(s) in '{sprint['name']}' to carry over.")
             if close_sprint(sprint["id"]):
-                log.info(f"Closed sprint '{sprint['name']}' (ended {end_date}).")
+                log.info(f"Closed sprint '{sprint['name']}' (ended {end}).")
             else:
                 log.error(f"Failed to close sprint '{sprint['name']}'.")
-
-    # Re-check: if no active sprint now, start the next future one
     if not get_active_sprint():
         future = get_future_sprints()
         if future:
-            next_sprint = future[0]
-            if start_sprint(next_sprint):
-                log.info(f"Started sprint '{next_sprint['name']}'.")
-
-                # Move carryover issues into the new active sprint
-                for issue in carryover_issues:
-                    key = issue["key"]
-                    if move_issue_to_sprint(key, next_sprint["id"]):
-                        log.info(f"Carried over {key} to sprint '{next_sprint['name']}'.")
-                    else:
-                        log.warning(f"Failed to carry over {key}.")
+            ns = future[0]
+            if start_sprint(ns):
+                log.info(f"Started sprint '{ns['name']}'.")
+                for issue in carryover:
+                    if move_issue_to_sprint(issue["key"], ns["id"]):
+                        log.info(f"Carried over {issue['key']} to '{ns['name']}'.")
             else:
-                log.error(f"Failed to start sprint '{next_sprint['name']}'.")
-        else:
-            log.warning("No future sprints available to start.")
+                log.error(f"Failed to start sprint '{ns['name']}'.")
+
+# ── JOB 1: Sprint Runway ─────────────────────────────────────────────────────
 
 def ensure_sprint_runway(future_sprints, required=8):
     if len(future_sprints) >= required:
-        log.info(f"Sprint runway OK — {len(future_sprints)} future sprints exist.")
+        log.info(f"Sprint runway OK — {len(future_sprints)} future sprints.")
         return future_sprints
     log.info(f"Only {len(future_sprints)} future sprints. Creating up to {required}...")
-    all_sprints = get_future_sprints() + get_active_sprint()
-    all_sprints.sort(key=lambda s: s.get("endDate", ""))
-    last_end = datetime.strptime(all_sprints[-1]["endDate"][:10], "%Y-%m-%d") if all_sprints else datetime.now()
+    all_s = get_future_sprints() + get_active_sprint()
+    all_s.sort(key=lambda s: s.get("endDate", ""))
+    last_end = datetime.strptime(all_s[-1]["endDate"][:10], "%Y-%m-%d") if all_s else datetime.now()
     for _ in range(required - len(future_sprints)):
         start = next_tuesday(last_end + timedelta(days=1))
-        end   = start + timedelta(days=13)
-        name  = f"{start.strftime('%d/%m/%Y')} - {end.strftime('%d/%m/%Y')}"
-        new   = create_sprint(name, start, end)
+        end = start + timedelta(days=13)
+        name = f"{start.strftime('%d/%m/%Y')} - {end.strftime('%d/%m/%Y')}"
+        new = create_sprint(name, start, end)
         if new:
             future_sprints.append(new)
         last_end = end
     future_sprints.sort(key=lambda s: s["startDate"])
     return future_sprints
 
-TEMPLATE_MARKER = "**Product Manager:**"
-DOR_DOD_LINK = '[**Definition of Ready (DoR) - Task Level**](https://axiscrm.atlassian.net/wiki/spaces/CAD/pages/91062273/Delivery+process#Definition-of-Ready-(DoR))   **|**   [**Definition of Done (DoD) - Task Level**](https://axiscrm.atlassian.net/wiki/spaces/CAD/pages/91062273/Delivery+process#Definition-of-Done-(DoD))'
-
-def get_tasks_needing_enrichment():
-    """Get all non-completed Task issues that don't yet have the full template."""
-    jql = 'project = AX AND issuetype = Task AND status not in (Done, Released) ORDER BY rank ASC'
-    params = {"jql": jql, "fields": "summary,description,priority,customfield_10016,status,parent", "maxResults": 100}
-    res = requests.get(f"{JIRA_BASE_URL}/rest/api/3/search/jql", auth=auth, headers=headers, params=params)
-    res.raise_for_status()
-    issues = res.json().get("issues", [])
-    # Filter to only those missing the full template
-    return [i for i in issues if not description_has_template(i["fields"].get("description") or "")]
-
-def description_has_template(desc):
-    """Check if description already contains the full enriched template."""
-    return TEMPLATE_MARKER in desc and "User story:" in desc and "Test plan:" in desc and "Technical plan:" in desc
-
-def extract_existing_content(desc):
-    """Pull out any existing summary, acceptance criteria, or other content from the current description."""
-    # Strip out DoR/DoD links and image blobs for cleaner extraction
-    cleaned = re.sub(r'\[?\*?\*?Definition of.*$', '', desc, flags=re.DOTALL)
-    cleaned = re.sub(r'!\[.*?\]\(blob:.*?\)', '[image attached]', cleaned)
-    return cleaned.strip()
-
-def call_claude_for_enrichment(summary, existing_description, story_points, priority, parent_summary):
-    """Call Claude API to generate the enriched description fields."""
-    if not ANTHROPIC_API_KEY:
-        log.warning("ANTHROPIC_API_KEY not set — skipping enrichment.")
-        return None
-
-    existing_content = extract_existing_content(existing_description)
-    sp_text = str(story_points) if story_points else "Not yet estimated"
-    broken_down = "Yes" if story_points and story_points <= 3 else "No" if story_points else "Not yet estimated"
-
-    prompt = f"""You are a Product Owner for a Life Insurance distribution CRM platform (Axis CRM).
-The platform is used by insurance advisers to manage clients, policies, applications, quotes, payments and commissions.
-Partner insurers include TAL, Zurich, AIA, MLC Life, MetLife, Resolution Life, Integrity Life and others.
-
-Given the following Jira Task, generate the enriched description fields. Be concise and specific to THIS task.
-Use the existing content as the primary source — preserve and improve it, don't discard it.
-
-TASK SUMMARY: {summary}
-PARENT EPIC: {parent_summary or 'None'}
-PRIORITY: {priority}
-STORY POINTS: {sp_text}
-EXISTING DESCRIPTION:
-{existing_content}
-
-Respond in EXACTLY this format (no extra text before or after):
-
-SUMMARY: <1-2 sentence summary of what this task delivers>
-USER_STORY: <As a [role], I want [action], so that [benefit]>
-ACCEPTANCE_CRITERIA: <bullet points, one per line, starting with "- ">
-TEST_PLAN: <numbered steps to verify the acceptance criteria are met>
-TECHNICAL_PLAN: <brief technical approach — mention relevant components, APIs, DB tables if inferrable. If unsure, write "To be completed by engineer during refinement.">
-"""
-
-    res = requests.post(
-        "https://api.anthropic.com/v1/messages",
-        headers={
-            "x-api-key": ANTHROPIC_API_KEY,
-            "anthropic-version": "2023-06-01",
-            "Content-Type": "application/json",
-        },
-        json={
-            "model": "claude-sonnet-4-20250514",
-            "max_tokens": 1024,
-            "messages": [{"role": "user", "content": prompt}],
-        },
-        timeout=30,
-    )
-
-    if res.status_code != 200:
-        log.error(f"Claude API error: {res.status_code} {res.text}")
-        return None
-
-    text = res.json()["content"][0]["text"].strip()
-    return parse_claude_response(text, story_points)
-
-def parse_claude_response(text, story_points):
-    """Parse the structured response from Claude into a dict."""
-    fields = {}
-    patterns = {
-        "summary": r"SUMMARY:\s*(.+?)(?=\nUSER_STORY:)",
-        "user_story": r"USER_STORY:\s*(.+?)(?=\nACCEPTANCE_CRITERIA:)",
-        "acceptance_criteria": r"ACCEPTANCE_CRITERIA:\s*(.+?)(?=\nTEST_PLAN:)",
-        "test_plan": r"TEST_PLAN:\s*(.+?)(?=\nTECHNICAL_PLAN:)",
-        "technical_plan": r"TECHNICAL_PLAN:\s*(.+)",
-    }
-    for key, pattern in patterns.items():
-        match = re.search(pattern, text, re.DOTALL)
-        fields[key] = match.group(1).strip() if match else ""
-
-    sp_text = str(story_points) if story_points else "Not yet estimated"
-    broken_down = "Yes" if story_points and story_points <= 3 else ("No — needs splitting" if story_points and story_points > 3 else "Not yet estimated")
-    fields["story_points_text"] = sp_text
-    fields["broken_down"] = broken_down
-    return fields
-
-def build_enriched_description(fields):
-    """Build the final markdown description from the enriched fields."""
-    ac_lines = fields["acceptance_criteria"]
-    # Convert bullet points to checkbox format
-    ac_formatted = re.sub(r'^- ', '- [ ] ', ac_lines, flags=re.MULTILINE)
-
-    return f"""**Product Manager:**
-1. **Summary:** {fields['summary']}
-2. **User story:** {fields['user_story']}
-3. **Acceptance criteria:**
-{ac_formatted}
-4. **Test plan:**
-{fields['test_plan']}
-
-**Engineer:**
-1. **Technical plan:** {fields['technical_plan']}
-2. **Story points estimated:** {fields['story_points_text']}
-3. **Task broken down (<=3 story points or split into parts):** {fields['broken_down']}
-
-{DOR_DOD_LINK}"""
-
-def update_issue_description(issue_key, new_description):
-    """Update the description of a Jira issue using the v3 API with ADF."""
-    # Build ADF from markdown — use the wiki markup approach via v2 API
-    res = requests.put(
-        f"{JIRA_BASE_URL}/rest/api/3/issue/{issue_key}",
-        auth=auth,
-        headers=headers,
-        json={
-            "update": {
-                "description": [{
-                    "set": {
-                        "version": 1,
-                        "type": "doc",
-                        "content": markdown_to_adf(new_description)
-                    }
-                }]
-            }
-        },
-    )
-    return res.status_code in (200, 204)
+# ── ADF conversion ────────────────────────────────────────────────────────────
 
 def markdown_to_adf(md_text):
-    """Convert simple markdown to ADF content nodes."""
     content = []
-    lines = md_text.split("\n")
-    for line in lines:
+    for line in md_text.split("\n"):
         line = line.rstrip()
         if not line:
             continue
-
-        # Convert inline bold **text** to ADF marks
-        inline_content = parse_inline_marks(line)
-        content.append({"type": "paragraph", "content": inline_content})
-
+        nodes = parse_inline_marks(line)
+        content.append({"type": "paragraph", "content": nodes})
     return content
 
 def parse_inline_marks(text):
-    """Parse inline markdown bold and links into ADF inline nodes."""
     nodes = []
-    # Pattern to match **bold**, [text](url), and plain text
     pattern = r'(\*\*(.+?)\*\*|\[(.+?)\]\((.+?)\)|[^*\[]+)'
-    for match in re.finditer(pattern, text):
-        full = match.group(0)
-        if match.group(2):  # Bold
-            nodes.append({"type": "text", "text": match.group(2), "marks": [{"type": "strong"}]})
-        elif match.group(3) and match.group(4):  # Link
-            nodes.append({"type": "text", "text": match.group(3), "marks": [{"type": "link", "attrs": {"href": match.group(4)}}]})
-        else:  # Plain text
-            if full.strip():
-                nodes.append({"type": "text", "text": full})
+    for m in re.finditer(pattern, text):
+        if m.group(2):
+            nodes.append({"type": "text", "text": m.group(2), "marks": [{"type": "strong"}]})
+        elif m.group(3) and m.group(4):
+            nodes.append({"type": "text", "text": m.group(3), "marks": [{"type": "link", "attrs": {"href": m.group(4)}}]})
+        else:
+            txt = m.group(0)
+            if txt.strip():
+                nodes.append({"type": "text", "text": txt})
     if not nodes:
         nodes.append({"type": "text", "text": text})
     return nodes
 
+# ══════════════════════════════════════════════════════════════════════════════
+# JOB 5: AI-Powered Ticket Enrichment
+# ══════════════════════════════════════════════════════════════════════════════
+
+def get_unreviewed_issues():
+    jql = 'project = AX AND Reviewed is EMPTY AND status not in (Done, Released) ORDER BY rank ASC'
+    field_list = f"summary,description,issuetype,priority,status,parent,issuelinks,attachment,{STORY_POINTS_FIELD},{REVIEWED_FIELD},sprint"
+    issues, start_at = [], 0
+    while True:
+        data = jira_get("/rest/api/3/search/jql", params={"jql": jql, "fields": field_list, "maxResults": 50, "startAt": start_at})
+        batch = data.get("issues", [])
+        issues.extend(batch)
+        if start_at + len(batch) >= data.get("total", 0):
+            break
+        start_at += len(batch)
+    return issues
+
+
+def fetch_linked_content(issue):
+    parts = []
+    desc = issue["fields"].get("description") or ""
+
+    page_ids = set()
+    for url in re.findall(r'https?://axiscrm\.atlassian\.net/wiki/\S+', desc):
+        m = re.search(r'/pages/(\d+)', url)
+        if m and m.group(1) != "91062273":
+            page_ids.add(m.group(1))
+
+    for link in issue["fields"].get("issuelinks") or []:
+        for d in ("inwardIssue", "outwardIssue"):
+            linked = link.get(d)
+            if linked:
+                parts.append(f"Linked issue {linked['key']}: {linked.get('fields', {}).get('summary', '')}")
+
+    for pid in page_ids:
+        try:
+            r = requests.get(f"{CONFLUENCE_BASE}/api/v2/pages/{pid}?body-format=atlas_doc_format", auth=auth, headers=headers, timeout=10)
+            if r.status_code == 200:
+                page = r.json()
+                body = page.get("body", {}).get("atlas_doc_format", {}).get("value", "")
+                if body:
+                    parts.append(f"Confluence page '{page.get('title', '')}': {body[:3000]}")
+        except Exception as e:
+            log.warning(f"Failed to fetch Confluence page {pid}: {e}")
+    return "\n\n".join(parts)
+
+
+def search_confluence_for_context(summary):
+    try:
+        r = requests.get(f"{CONFLUENCE_BASE}/rest/api/search", auth=auth, headers=headers, timeout=10,
+            params={"cql": f'type = page AND space = "CAD" AND text ~ "{summary[:60]}"', "limit": 3})
+        if r.status_code == 200:
+            return "\n".join(f"- {res['title']}: {res.get('excerpt', '')[:400]}" for res in r.json().get("results", []))
+    except Exception:
+        pass
+    return ""
+
+
+def call_claude(prompt, max_tokens=2048):
+    if not ANTHROPIC_API_KEY:
+        return None
+    try:
+        r = requests.post("https://api.anthropic.com/v1/messages",
+            headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "Content-Type": "application/json"},
+            json={"model": "claude-sonnet-4-20250514", "max_tokens": max_tokens, "messages": [{"role": "user", "content": prompt}]},
+            timeout=60)
+        if r.status_code == 200:
+            return r.json()["content"][0]["text"].strip()
+        log.error(f"Claude API error: {r.status_code} {r.text[:300]}")
+    except Exception as e:
+        log.error(f"Claude API exception: {e}")
+    return None
+
+
+def build_enrichment_prompt(issue, linked_content, confluence_context, issue_type):
+    f = issue["fields"]
+    summary = f["summary"]
+    desc = f.get("description") or ""
+    priority = (f.get("priority") or {}).get("name", "Medium")
+    parent_summary = (f.get("parent") or {}).get("fields", {}).get("summary", "")
+    sp = f.get(STORY_POINTS_FIELD)
+    status = (f.get("status") or {}).get("name", "")
+
+    clean_desc = re.sub(r'\[?\*?\*?Definition of (Ready|Done).*$', '', desc, flags=re.DOTALL).strip()
+    clean_desc = re.sub(r'!\[.*?\]\(blob:.*?\)', '[image attached]', clean_desc)
+
+    ctx = ""
+    if linked_content:
+        ctx += f"\nLINKED CONTENT:\n{linked_content}\n"
+    if confluence_context:
+        ctx += f"\nRELATED CONFLUENCE PAGES:\n{confluence_context}\n"
+
+    base = f"""You are a senior Product Manager for Axis CRM, a life insurance distribution CRM platform.
+The platform is used by AFSL-licensed insurance advisers to manage clients, policies, applications, quotes, payments and commissions.
+Partner insurers include TAL, Zurich, AIA, MLC Life, MetLife, Resolution Life, Integrity Life and others.
+The CRM serves multiple divisions: LIP (lead intake & processing) team, services team, and advisers.
+
+You are enriching a Jira {issue_type} ticket. Fill in ONLY the Product Manager section.
+Leave Engineer section fields empty — engineers fill those during refinement.
+
+TICKET: {issue["key"]}
+CURRENT SUMMARY: {summary}
+PARENT EPIC: {parent_summary or 'None'}
+PRIORITY: {priority}
+STATUS: {status}
+CURRENT STORY POINTS: {sp or 'Not set'}
+EXISTING DESCRIPTION:
+{clean_desc}
+{ctx}
+"""
+
+    if issue_type == "Epic":
+        base += """
+RESPOND IN EXACTLY THIS JSON FORMAT (no markdown fences):
+{
+  "polished_summary": "<concise epic title>",
+  "pm_summary": "<1-2 sentence summary of what this epic delivers and why>",
+  "validated": "No",
+  "rice_score": "TBD - requires stakeholder input",
+  "prd": "TBD"
+}"""
+    elif issue_type == "Task":
+        base += f"""
+RULES:
+- polished_summary MUST be user story format: "As a [role], I want [action], so that [benefit]"
+- Estimate story points: 1 (~2hrs), 2 (~4hrs), 3 (~1 day). Max 3 per ticket.
+- If work exceeds 3 story points, set needs_split=true and provide split_tasks.
+- Each split task must be independently shippable, <=3 story points, user story format.
+- Current story points: {sp or 'Not set'}. If already set and <=3, keep them.
+
+RESPOND IN EXACTLY THIS JSON FORMAT (no markdown fences):
+{{
+  "polished_summary": "<user story format>",
+  "pm_summary": "<1-2 sentence summary>",
+  "user_story": "<As a [role], I want [action], so that [benefit]>",
+  "acceptance_criteria": ["<criterion 1>", "<criterion 2>"],
+  "test_plan": "1. <step>\\n2. <step>",
+  "story_points": <1-3>,
+  "needs_split": <true or false>,
+  "split_tasks": [
+    {{"summary": "<user story>", "story_points": <1-3>, "acceptance_criteria": ["..."]}}
+  ]
+}}"""
+    elif issue_type == "Bug":
+        base += f"""
+RULES:
+- polished_summary should clearly describe the bug.
+- Estimate story points: 1 (~2hrs), 2 (~4hrs), 3 (~1 day). Max 3.
+- If fix exceeds 3 story points, set needs_split=true.
+
+RESPOND IN EXACTLY THIS JSON FORMAT (no markdown fences):
+{{
+  "polished_summary": "<clear bug description>",
+  "pm_summary": "<expected vs actual behaviour, impact>",
+  "story_points": <1-3>,
+  "needs_split": false,
+  "split_tasks": []
+}}"""
+    elif issue_type == "Maintenance":
+        base += f"""
+RULES:
+- polished_summary should describe the maintenance work clearly.
+- Estimate story points: 1 (~2hrs), 2 (~4hrs), 3 (~1 day). Max 3.
+
+RESPOND IN EXACTLY THIS JSON FORMAT (no markdown fences):
+{{
+  "polished_summary": "<maintenance description>",
+  "pm_summary": "<what maintenance is needed and why>",
+  "story_points": <1-3>,
+  "needs_split": false,
+  "split_tasks": []
+}}"""
+    elif issue_type == "Spike":
+        base += f"""
+RULES:
+- polished_summary should frame the investigation question.
+- Spikes are timeboxed. Estimate story points: 1 (~2hrs), 2 (~4hrs), 3 (~1 day). Max 3.
+
+RESPOND IN EXACTLY THIS JSON FORMAT (no markdown fences):
+{{
+  "polished_summary": "<investigation question>",
+  "pm_summary": "<what needs investigating, what decision it informs>",
+  "story_points": <1-3>,
+  "needs_split": false,
+  "split_tasks": []
+}}"""
+    elif issue_type == "Support":
+        base += f"""
+RULES:
+- polished_summary should describe the support request clearly.
+- Estimate story points: 1 (~2hrs), 2 (~4hrs), 3 (~1 day). Max 3.
+
+RESPOND IN EXACTLY THIS JSON FORMAT (no markdown fences):
+{{
+  "polished_summary": "<support request description>",
+  "pm_summary": "<what the stakeholder needs and why>",
+  "story_points": <1-3>,
+  "needs_split": false,
+  "split_tasks": []
+}}"""
+
+    return base
+
+
+def build_description_markdown(issue_type, enrichment):
+    if issue_type == "Epic":
+        return f"""**Product Manager:**
+1. **Summary:** {enrichment.get('pm_summary', '')}
+2. **Validated:** {enrichment.get('validated', 'No')}
+3. **RICE score:** {enrichment.get('rice_score', 'TBD')}
+4. **PRD:** {enrichment.get('prd', 'TBD')}
+
+{DOR_DOD_EPIC}"""
+
+    elif issue_type == "Task":
+        ac = enrichment.get("acceptance_criteria", [])
+        ac_str = "\n".join(f"- [ ] {c}" for c in ac) if ac else "- [ ] "
+        return f"""**Product Manager:**
+1. **Summary:** {enrichment.get('pm_summary', '')}
+2. **User story:** {enrichment.get('user_story', '')}
+3. **Acceptance criteria:**
+{ac_str}
+4. **Test plan:**
+{enrichment.get('test_plan', '')}
+
+**Engineer:**
+1. **Technical plan:**
+2. **Story points estimated:**
+3. **Task broken down (<=3 story points or split into parts):** Yes/No
+
+{DOR_DOD_TASK}"""
+
+    elif issue_type == "Bug":
+        return f"""**Product Manager:**
+1. **Summary:** {enrichment.get('pm_summary', '')}
+
+**Engineer:**
+1. **Investigation:**
+
+{DOR_DOD_TASK}"""
+
+    elif issue_type == "Maintenance":
+        return f"""**Product Manager:**
+1. **Summary:** {enrichment.get('pm_summary', '')}
+
+**Engineer:**
+1. **Task:**
+
+{DOR_DOD_TASK}"""
+
+    else:  # Spike, Support
+        return f"""**Product Manager:**
+1. **Summary:** {enrichment.get('pm_summary', '')}
+
+**Engineer:**
+1. **Investigation:**
+
+{DOR_DOD_TASK}"""
+
+
+def update_issue_fields(issue_key, summary=None, description_md=None, story_points=None, set_reviewed=True):
+    payload = {"fields": {}, "update": {}}
+
+    if summary:
+        payload["fields"]["summary"] = summary
+    if story_points is not None:
+        payload["fields"][STORY_POINTS_FIELD] = float(story_points)
+    if set_reviewed:
+        payload["fields"][REVIEWED_FIELD] = [{"value": "Yes"}]
+    if description_md:
+        payload["update"]["description"] = [{"set": {"version": 1, "type": "doc", "content": markdown_to_adf(description_md)}}]
+
+    if not payload["fields"]:
+        del payload["fields"]
+    if not payload["update"]:
+        del payload["update"]
+
+    ok, r = jira_put(f"/rest/api/3/issue/{issue_key}", payload)
+    if not ok:
+        log.warning(f"Failed to update {issue_key}: {r.status_code} {r.text[:300]}")
+    return ok
+
+
+def create_split_ticket(original_issue, split_data, issue_type):
+    f = original_issue["fields"]
+
+    if issue_type == "Task":
+        ac = split_data.get("acceptance_criteria", [])
+        ac_str = "\n".join(f"- [ ] {c}" for c in ac) if ac else "- [ ] "
+        desc_md = f"""**Product Manager:**
+1. **Summary:** Split from {original_issue['key']}
+2. **User story:** {split_data.get('summary', '')}
+3. **Acceptance criteria:**
+{ac_str}
+4. **Test plan:**
+
+**Engineer:**
+1. **Technical plan:**
+2. **Story points estimated:**
+3. **Task broken down (<=3 story points or split into parts):** Yes
+
+{DOR_DOD_TASK}"""
+    else:
+        desc_md = f"""**Product Manager:**
+1. **Summary:** Split from {original_issue['key']} — {split_data.get('summary', '')}
+
+**Engineer:**
+1. **Investigation:**
+
+{DOR_DOD_TASK}"""
+
+    payload = {
+        "fields": {
+            "project": {"key": "AX"},
+            "summary": split_data["summary"],
+            "issuetype": {"name": issue_type},
+            STORY_POINTS_FIELD: float(split_data.get("story_points", 2)),
+            REVIEWED_FIELD: [{"value": "Yes"}],
+            "description": {"version": 1, "type": "doc", "content": markdown_to_adf(desc_md)},
+        }
+    }
+
+    if f.get("parent"):
+        payload["fields"]["parent"] = {"key": f["parent"]["key"]}
+    if f.get("assignee"):
+        payload["fields"]["assignee"] = {"accountId": f["assignee"]["accountId"]}
+    if f.get("priority"):
+        payload["fields"]["priority"] = {"name": f["priority"]["name"]}
+
+    ok, r = jira_post("/rest/api/3/issue", payload)
+    if ok:
+        new_key = r.json().get("key", "?")
+        log.info(f"  Created split ticket {new_key}: {split_data['summary']} ({split_data.get('story_points', 2)}pts)")
+        sprint_data = f.get("sprint")
+        if sprint_data and sprint_data.get("id"):
+            move_issue_to_sprint(new_key, sprint_data["id"])
+        return new_key
+    else:
+        log.error(f"  Failed to create split: {r.status_code} {r.text[:300]}")
+        return None
+
+
 def enrich_ticket_descriptions():
-    """JOB 5: Enrich Task descriptions to match the standard template."""
     if not ANTHROPIC_API_KEY:
         log.info("JOB 5 skipped — ANTHROPIC_API_KEY not set.")
         return
 
-    tasks = get_tasks_needing_enrichment()
-    if not tasks:
-        log.info("No tasks need enrichment.")
+    issues = get_unreviewed_issues()
+    if not issues:
+        log.info("JOB 5: No unreviewed tickets found.")
         return
 
-    log.info(f"Found {len(tasks)} task(s) needing enrichment.")
+    log.info(f"JOB 5: Found {len(issues)} unreviewed ticket(s) to enrich.")
 
-    for issue in tasks:
+    for issue in issues:
         key = issue["key"]
-        fields = issue["fields"]
-        summary = fields["summary"]
-        description = fields.get("description") or ""
-        story_points = fields.get("customfield_10016")
-        priority = fields.get("priority", {}).get("name", "Medium")
-        parent_summary = ""
-        if fields.get("parent"):
-            parent_summary = fields["parent"].get("fields", {}).get("summary", "")
+        f = issue["fields"]
+        issue_type = f["issuetype"]["name"]
+        summary = f["summary"]
 
-        log.info(f"Enriching {key}: {summary}")
-
-        enriched = call_claude_for_enrichment(summary, description, story_points, priority, parent_summary)
-        if not enriched:
-            log.warning(f"Skipping {key} — enrichment failed.")
+        if issue_type not in SUPPORTED_TYPES:
+            log.info(f"  Skipping {key} — unsupported type '{issue_type}', marking reviewed.")
+            update_issue_fields(key, set_reviewed=True)
             continue
 
-        new_desc = build_enriched_description(enriched)
-        if update_issue_description(key, new_desc):
-            log.info(f"Updated {key} with enriched description.")
+        log.info(f"  Enriching {key} ({issue_type}): {summary}")
+
+        linked_content = fetch_linked_content(issue)
+        confluence_context = search_confluence_for_context(summary)
+
+        prompt = build_enrichment_prompt(issue, linked_content, confluence_context, issue_type)
+        response = call_claude(prompt)
+
+        if not response:
+            log.warning(f"  Skipping {key} — Claude enrichment failed.")
+            continue
+
+        try:
+            clean = re.sub(r'^```(?:json)?\s*', '', response)
+            clean = re.sub(r'\s*```$', '', clean)
+            enrichment = json.loads(clean)
+        except json.JSONDecodeError as e:
+            log.warning(f"  Skipping {key} — JSON parse error: {e}")
+            log.debug(f"  Response: {response[:500]}")
+            continue
+
+        polished_summary = enrichment.get("polished_summary", summary)
+        new_desc = build_description_markdown(issue_type, enrichment)
+
+        new_sp = None
+        if issue_type != "Epic":
+            existing_sp = f.get(STORY_POINTS_FIELD)
+            claude_sp = enrichment.get("story_points")
+            if claude_sp is not None:
+                new_sp = min(max(int(claude_sp), 1), 8)
+            elif existing_sp:
+                new_sp = existing_sp
+
+        needs_split = enrichment.get("needs_split", False)
+        split_tasks = enrichment.get("split_tasks", [])
+
+        if needs_split and split_tasks and len(split_tasks) > 1:
+            log.info(f"  {key} needs splitting into {len(split_tasks)} tickets.")
+            created_keys = []
+            for st in split_tasks:
+                nk = create_split_ticket(issue, st, issue_type)
+                if nk:
+                    created_keys.append(nk)
+
+            split_note = f"This ticket has been split into {len(created_keys)} smaller tickets: {', '.join(created_keys)}."
+            if issue_type == "Task":
+                split_desc = f"""**Product Manager:**
+1. **Summary:** {split_note}
+2. **User story:** See child tickets.
+3. **Acceptance criteria:**
+- [ ] All split tickets completed
+4. **Test plan:**
+Verify all split tickets pass their individual test plans.
+
+**Engineer:**
+1. **Technical plan:**
+2. **Story points estimated:**
+3. **Task broken down (<=3 story points or split into parts):** Yes
+
+{DOR_DOD_TASK}"""
+            elif issue_type == "Epic":
+                split_desc = f"""**Product Manager:**
+1. **Summary:** {split_note}
+2. **Validated:** No
+3. **RICE score:** TBD
+4. **PRD:** TBD
+
+{DOR_DOD_EPIC}"""
+            else:
+                split_desc = f"""**Product Manager:**
+1. **Summary:** {split_note}
+
+**Engineer:**
+1. **Investigation:**
+
+{DOR_DOD_TASK}"""
+
+            update_issue_fields(key, summary=f"[SPLIT] {polished_summary}", description_md=split_desc,
+                story_points=0 if issue_type != "Epic" else None, set_reviewed=True)
         else:
-            log.warning(f"Failed to update {key}.")
+            update_issue_fields(key, summary=polished_summary, description_md=new_desc,
+                story_points=new_sp, set_reviewed=True)
+
+        log.info(f"  Completed {key}.")
+
+
+# ── Main run ──────────────────────────────────────────────────────────────────
 
 def run():
     log.info("=== Starting Jira prioritisation run ===")
     try:
-        # JOB 0: Sprint lifecycle (close expired, start next)
         log.info("JOB 0: Sprint Lifecycle")
         manage_sprint_lifecycle()
 
-        # JOB 1: Sprint runway
         log.info("JOB 1: Sprint Runway")
         future_sprints = get_future_sprints()
         future_sprints = ensure_sprint_runway(future_sprints, required=8)
 
-        # JOB 2: Move backlog to sprints
         log.info("JOB 2: Move Backlog to Sprints")
         backlog = get_andrej_ready_backlog()
         if not backlog:
             log.info("No READY backlog issues to move.")
         else:
-            backlog_idx = 0
+            idx = 0
             for sprint in future_sprints:
-                if backlog_idx >= len(backlog):
+                if idx >= len(backlog):
                     break
-                sprint_id   = sprint["id"]
-                sprint_name = sprint["name"]
-                available   = MAX_SPRINT_POINTS - get_sprint_todo_points(sprint_id)
-                log.info(f"Sprint '{sprint_name}': {available}pts available.")
-                if available <= 0:
+                sid, sname = sprint["id"], sprint["name"]
+                avail = MAX_SPRINT_POINTS - get_sprint_todo_points(sid)
+                log.info(f"Sprint '{sname}': {avail}pts available.")
+                if avail <= 0:
                     continue
-                while backlog_idx < len(backlog) and available > 0:
-                    issue = backlog[backlog_idx]
-                    key   = issue["key"]
-                    pts   = issue["fields"].get("customfield_10016") or 0
-                    pri   = issue["fields"]["priority"]["name"]
-                    if pts > available:
-                        backlog_idx += 1
+                while idx < len(backlog) and avail > 0:
+                    issue = backlog[idx]
+                    key = issue["key"]
+                    pts = issue["fields"].get(STORY_POINTS_FIELD) or 0
+                    pri = issue["fields"]["priority"]["name"]
+                    if pts > avail:
+                        idx += 1
                         continue
-                    if move_issue_to_sprint(key, sprint_id):
-                        available -= pts
-                        log.info(f"Moved {key} ({pts}pts) [{pri}] to '{sprint_name}'. {available}pts left.")
-                    backlog_idx += 1
+                    if move_issue_to_sprint(key, sid):
+                        avail -= pts
+                        log.info(f"Moved {key} ({pts}pts) [{pri}] to '{sname}'. {avail}pts left.")
+                    idx += 1
 
-        # JOB 3: Rank all sprints
         log.info("JOB 3: Rank All Sprints")
         for sprint in future_sprints:
             rank_issues(get_sprint_issues(sprint["id"]), f"Sprint '{sprint['name']}'")
         for sprint in get_active_sprint():
             rank_issues(get_sprint_issues(sprint["id"]), f"Active sprint '{sprint['name']}'")
 
-        # JOB 4: Rank backlog
         log.info("JOB 4: Rank Backlog")
         backlog_all = get_backlog_issues()
         if backlog_all:
             rank_issues(backlog_all, "Backlog")
 
-        # JOB 5: Enrich ticket descriptions
         log.info("JOB 5: Enrich Ticket Descriptions")
         enrich_ticket_descriptions()
 
         log.info("=== Run complete ===")
-
     except Exception as e:
         log.error(f"Run failed: {e}", exc_info=True)
+
 
 if __name__ == "__main__":
     sydney_tz = pytz.timezone("Australia/Sydney")
     scheduler = BlockingScheduler(timezone=sydney_tz)
-
     for hour, minute, name in [(7, 0, "7:00am"), (12, 0, "12:00pm"), (16, 0, "4:00pm")]:
-        scheduler.add_job(
-            run,
-            trigger=CronTrigger(day_of_week="mon-fri", hour=hour, minute=minute, timezone=sydney_tz),
-            id=name,
-            name=f"{name} Sydney Run"
-        )
-
-    log.info("Scheduler started — running at 7:00am, 12:00pm, 4:00pm AEDT Mon–Fri.")
-    run()  # Fire once on startup
+        scheduler.add_job(run, trigger=CronTrigger(day_of_week="mon-fri", hour=hour, minute=minute, timezone=sydney_tz), id=name, name=f"{name} Sydney Run")
+    log.info("Scheduler started — running at 7:00am, 12:00pm, 4:00pm AEDT Mon-Fri.")
+    run()
     scheduler.start()
