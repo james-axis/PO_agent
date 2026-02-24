@@ -328,13 +328,19 @@ EXISTING DESCRIPTION:
 
     if issue_type == "Epic":
         base += """
+RULES:
+- Look through the LINKED CONTENT and EXISTING DESCRIPTION for an "Idea" ticket or Confluence page.
+- From the linked Idea/content, extract: whether it is validated (Yes/No), a RICE score, and a PRD link.
+- If a PRD URL exists in the linked content, use the full URL (e.g. "https://...").
+- If any field is not found, use "N/A".
+
 RESPOND IN EXACTLY THIS JSON FORMAT (no markdown fences):
 {
   "polished_summary": "<concise epic title>",
   "pm_summary": "<1-2 sentence summary of what this epic delivers and why>",
-  "validated": "No",
-  "rice_score": "TBD - requires stakeholder input",
-  "prd": "TBD"
+  "validated": "<Yes or No or N/A>",
+  "rice_score": "<number or N/A>",
+  "prd": "<full URL or N/A>"
 }"""
     elif issue_type == "Task":
         base += f"""
@@ -423,9 +429,9 @@ def build_description_markdown(issue_type, enrichment):
     if issue_type == "Epic":
         return f"""**Product Manager:**
 1. **Summary:** {enrichment.get('pm_summary', '')}
-2. **Validated:** {enrichment.get('validated', 'No')}
-3. **RICE score:** {enrichment.get('rice_score', 'TBD')}
-4. **PRD:** {enrichment.get('prd', 'TBD')}
+2. **Validated:** {enrichment.get('validated', 'N/A')}
+3. **RICE score:** {enrichment.get('rice_score', 'N/A')}
+4. **PRD:** {enrichment.get('prd', 'N/A')}
 
 {DOR_DOD_EPIC}"""
 
@@ -643,9 +649,9 @@ Verify all split tickets pass their individual test plans.
             elif issue_type == "Epic":
                 split_desc = f"""**Product Manager:**
 1. **Summary:** {split_note}
-2. **Validated:** No
-3. **RICE score:** TBD
-4. **PRD:** TBD
+2. **Validated:** N/A
+3. **RICE score:** N/A
+4. **PRD:** N/A
 
 {DOR_DOD_EPIC}"""
             else:
