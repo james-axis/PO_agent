@@ -244,8 +244,25 @@ def fetch_linked_content(issue):
     for link in issue["fields"].get("issuelinks") or []:
         for d in ("inwardIssue", "outwardIssue"):
             linked = link.get(d)
-            if linked:
-                parts.append(f"Linked issue {linked['key']}: {linked.get('fields', {}).get('summary', '')}")
+            if not linked:
+                continue
+            linked_key = linked.get("key", "")
+            linked_summary = linked.get("fields", {}).get("summary", "")
+            linked_type = linked.get("fields", {}).get("issuetype", {}).get("name", "")
+
+            # For Idea issues, fetch full details including description
+            if linked_type == "Idea":
+                try:
+                    idea = jira_get(f"/rest/api/3/issue/{linked_key}", params={"fields": "summary,description,customfield_10016,status,priority"})
+                    idea_desc = idea.get("fields", {}).get("description") or ""
+                    if isinstance(idea_desc, dict):
+                        idea_desc = adf_to_text(idea_desc)
+                    parts.append(f"Linked Idea {linked_key}: {linked_summary}\nIdea description: {idea_desc[:4000]}")
+                except Exception as e:
+                    log.warning(f"Failed to fetch Idea {linked_key}: {e}")
+                    parts.append(f"Linked Idea {linked_key}: {linked_summary}")
+            else:
+                parts.append(f"Linked issue {linked_key}: {linked_summary}")
 
     for pid in page_ids:
         try:
