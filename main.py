@@ -104,10 +104,12 @@ def start_sprint(sprint):
     })
     return res.status_code in (200, 204)
 
+COMPLETED_STATUSES = {"done", "released"}
+
 def get_incomplete_issues(sprint_id):
     """Get issues from a sprint that are not Done or Released."""
     issues = get_sprint_issues(sprint_id)
-    return [i for i in issues if i["fields"]["status"]["name"] not in ("Done", "Released")]
+    return [i for i in issues if i["fields"]["status"]["name"].lower() not in COMPLETED_STATUSES]
 
 def manage_sprint_lifecycle():
     """Close expired active sprints, carry over incomplete issues, and start the next sprint."""
