@@ -24,10 +24,25 @@ MAX_SPRINT_POINTS  = 40
 PRIORITY_ORDER     = {"Highest": 1, "High": 2, "Medium": 3, "Low": 4, "Lowest": 5}
 COMPLETED_STATUSES = {"done", "released"}
 STORY_POINTS_FIELD = "customfield_10016"
-REVIEWED_FIELD     = "customfield_10128"
+REVIEWED_FIELD     = None  # Auto-discovered at startup
 
 auth    = (JIRA_EMAIL, JIRA_API_TOKEN)
 headers = {"Accept": "application/json", "Content-Type": "application/json"}
+
+def discover_reviewed_field():
+    """Find the custom field ID for the 'Reviewed' text field."""
+    global REVIEWED_FIELD
+    try:
+        r = requests.get(f"{JIRA_BASE_URL}/rest/api/3/field", auth=auth, headers=headers)
+        r.raise_for_status()
+        for f in r.json():
+            if f.get("name") == "Reviewed" and f.get("custom", False):
+                REVIEWED_FIELD = f["id"]
+                log.info(f"Discovered Reviewed field: {REVIEWED_FIELD}")
+                return
+        log.warning("Could not find 'Reviewed' custom field — JOB 5 will skip Reviewed updates.")
+    except Exception as e:
+        log.error(f"Failed to discover Reviewed field: {e}")
 
 DOR_DOD_TASK = '[**Definition of Ready (DoR) - Task Level**](https://axiscrm.atlassian.net/wiki/spaces/CAD/pages/91062273/Delivery+process#Definition-of-Ready-(DoR))   **|**   [**Definition of Done (DoD) - Task Level**](https://axiscrm.atlassian.net/wiki/spaces/CAD/pages/91062273/Delivery+process#Definition-of-Done-(DoD))'
 DOR_DOD_EPIC = '[**Definition of Ready (DoR) - Epic Level**](https://axiscrm.atlassian.net/wiki/spaces/CAD/pages/91062273/Delivery+process#Definition-of-Ready-(DoR))   **|**   [**Definition of Done (DoD) - Epic Level**](https://axiscrm.atlassian.net/wiki/spaces/CAD/pages/91062273/Delivery+process#Definition-of-Done-(DoD))'
@@ -196,7 +211,9 @@ def parse_inline_marks(text):
 
 def get_unreviewed_issues():
     jql = 'project = AX AND (Reviewed is EMPTY OR Reviewed = "Partially") AND status not in (Done, Released) ORDER BY rank ASC'
-    field_list = f"summary,description,issuetype,priority,status,parent,issuelinks,attachment,{STORY_POINTS_FIELD},{REVIEWED_FIELD},sprint"
+    field_list = f"summary,description,issuetype,priority,status,parent,issuelinks,attachment,{STORY_POINTS_FIELD},sprint"
+    if REVIEWED_FIELD:
+        field_list += f",{REVIEWED_FIELD}"
     issues, start_at = [], 0
     while True:
         data = jira_get("/rest/api/3/search/jql", params={"jql": jql, "fields": field_list, "maxResults": 50, "startAt": start_at})
@@ -506,8 +523,8 @@ def update_issue_fields(issue_key, summary=None, description_md=None, story_poin
         payload["fields"]["summary"] = summary
     if story_points is not None:
         payload["fields"][STORY_POINTS_FIELD] = float(story_points)
-    if reviewed_value:
-        payload["fields"][REVIEWED_FIELD] = [{"value": reviewed_value}]
+    if reviewed_value and REVIEWED_FIELD:
+        payload["fields"][REVIEWED_FIELD] = reviewed_value
     if description_md:
         payload["update"]["description"] = [{"set": {"version": 1, "type": "doc", "content": markdown_to_adf(description_md)}}]
 
@@ -556,10 +573,11 @@ def create_split_ticket(original_issue, split_data, issue_type):
             "summary": split_data["summary"],
             "issuetype": {"name": issue_type},
             STORY_POINTS_FIELD: float(split_data.get("story_points", 2)),
-            REVIEWED_FIELD: [{"value": "Yes"}],
             "description": {"version": 1, "type": "doc", "content": markdown_to_adf(desc_md)},
         }
     }
+    if REVIEWED_FIELD:
+        payload["fields"][REVIEWED_FIELD] = "Yes"
 
     if f.get("parent"):
         payload["fields"]["parent"] = {"key": f["parent"]["key"]}
@@ -791,5 +809,6 @@ if __name__ == "__main__":
     for hour, minute, name in [(7, 0, "7:00am"), (12, 0, "12:00pm"), (16, 0, "4:00pm")]:
         scheduler.add_job(run, trigger=CronTrigger(day_of_week="mon-fri", hour=hour, minute=minute, timezone=sydney_tz), id=name, name=f"{name} Sydney Run")
     log.info("Scheduler started — running at 7:00am, 12:00pm, 4:00pm AEDT Mon-Fri.")
+    discover_reviewed_field()
     run()
     scheduler.start()
