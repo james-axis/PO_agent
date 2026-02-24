@@ -211,15 +211,17 @@ def parse_inline_marks(text):
 
 def get_unreviewed_issues():
     jql = 'project = AX AND (Reviewed is EMPTY OR Reviewed = "Partially") AND status not in (Done, Released) ORDER BY rank ASC'
-    field_list = f"summary,description,issuetype,priority,status,parent,issuelinks,attachment,{STORY_POINTS_FIELD},sprint"
+    field_list = f"summary,description,issuetype,priority,status,parent,issuelinks,attachment,assignee,{STORY_POINTS_FIELD},sprint"
     if REVIEWED_FIELD:
         field_list += f",{REVIEWED_FIELD}"
     issues, start_at = [], 0
     while True:
         data = jira_get("/rest/api/3/search/jql", params={"jql": jql, "fields": field_list, "maxResults": 50, "startAt": start_at})
         batch = data.get("issues", [])
+        total = data.get("total", 0)
         issues.extend(batch)
-        if start_at + len(batch) >= data.get("total", 0):
+        log.info(f"  Fetched {len(issues)}/{total} unreviewed issues...")
+        if start_at + len(batch) >= total:
             break
         start_at += len(batch)
     return issues
@@ -646,6 +648,11 @@ def enrich_ticket_descriptions():
         return
 
     log.info(f"JOB 5: Found {len(issues)} unreviewed ticket(s) to enrich.")
+    type_counts = {}
+    for i in issues:
+        t = i["fields"]["issuetype"]["name"]
+        type_counts[t] = type_counts.get(t, 0) + 1
+    log.info(f"  Breakdown: {type_counts}")
 
     for issue in issues:
         key = issue["key"]
