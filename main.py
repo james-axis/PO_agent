@@ -208,9 +208,32 @@ def get_unreviewed_issues():
     return issues
 
 
+def adf_to_text(node):
+    """Recursively extract plain text from an ADF node (dict or list)."""
+    if isinstance(node, str):
+        return node
+    if isinstance(node, list):
+        return " ".join(adf_to_text(n) for n in node)
+    if isinstance(node, dict):
+        parts = []
+        if "text" in node:
+            parts.append(node["text"])
+        if "attrs" in node and "href" in node.get("attrs", {}):
+            parts.append(node["attrs"]["href"])
+        if "marks" in node:
+            for m in node["marks"]:
+                if m.get("type") == "link" and "attrs" in m:
+                    parts.append(m["attrs"].get("href", ""))
+        for child in node.get("content", []):
+            parts.append(adf_to_text(child))
+        return " ".join(parts)
+    return ""
+
+
 def fetch_linked_content(issue):
     parts = []
-    desc = issue["fields"].get("description") or ""
+    raw_desc = issue["fields"].get("description") or ""
+    desc = adf_to_text(raw_desc) if isinstance(raw_desc, dict) else raw_desc
 
     page_ids = set()
     for url in re.findall(r'https?://axiscrm\.atlassian\.net/wiki/\S+', desc):
@@ -268,6 +291,8 @@ def build_enrichment_prompt(issue, linked_content, confluence_context, issue_typ
     f = issue["fields"]
     summary = f["summary"]
     desc = f.get("description") or ""
+    if isinstance(desc, dict):
+        desc = adf_to_text(desc)
     priority = (f.get("priority") or {}).get("name", "Medium")
     parent_summary = (f.get("parent") or {}).get("fields", {}).get("summary", "")
     sp = f.get(STORY_POINTS_FIELD)
