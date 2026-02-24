@@ -26,6 +26,35 @@ COMPLETED_STATUSES = {"done", "released"}
 STORY_POINTS_FIELD = "customfield_10016"
 REVIEWED_FIELD     = None  # Auto-discovered at startup
 
+# ── AR (Strategic Roadmap / JPD) Config ───────────────────────────────────────
+AR_PROJECT_KEY     = "AR"
+RICE_REACH_FIELD   = "customfield_10526"
+RICE_IMPACT_FIELD  = "customfield_10047"
+RICE_CONFIDENCE_FIELD = "customfield_10527"
+RICE_EFFORT_FIELD  = "customfield_10058"
+RICE_VALUE_FIELD   = "customfield_10195"   # Formula: auto-computed by JPD
+ROADMAP_FIELD      = "customfield_10560"
+SWIMLANE_FIELD     = "customfield_10694"
+ADVISER_FIELD      = "customfield_10696"
+USER_FEEDBACK_OPTION_ID = "10575"
+
+# Roadmap column option IDs, ordered left-to-right (highest priority first)
+ROADMAP_COLUMNS = [
+    {"value": "February (S2)", "id": "10232"},
+    {"value": "March (S1)",    "id": "10233"},
+    {"value": "March (S2)",    "id": "10269"},
+    {"value": "April (S1)",    "id": "10529"},
+    {"value": "April (S2)",    "id": "10530"},
+    {"value": "May (S1)",      "id": "10531"},
+    {"value": "May (S2)",      "id": "10538"},
+    {"value": "June (S1)",     "id": "10539"},
+    {"value": "June (S2)",     "id": "10540"},
+    {"value": "July (S1)",     "id": "10537"},
+    {"value": "July (S2)",     "id": "10541"},
+]
+ROADMAP_BACKLOG_ID = "10536"
+IDEAS_PER_COLUMN   = 3  # Max ideas per roadmap column (2-3 for first, 3 for rest)
+
 auth    = (JIRA_EMAIL, JIRA_API_TOKEN)
 headers = {"Accept": "application/json", "Content-Type": "application/json"}
 
@@ -752,6 +781,222 @@ Verify all split tickets pass their individual test plans.
         log.info(f"  Completed {key}.")
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# JOB 6: User Feedback Idea Processing (AR Strategic Roadmap)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def get_user_feedback_ideas(scored_only=False):
+    """Fetch AR ideas in the 'User Feedback' swimlane."""
+    jql = f'project = {AR_PROJECT_KEY} AND cf[10694] = "User Feedback"'
+    if scored_only:
+        jql += f' AND cf[10526] is not EMPTY AND cf[10047] is not EMPTY AND cf[10527] is not EMPTY AND cf[10058] is not EMPTY'
+    else:
+        jql += f' AND (cf[10526] is EMPTY OR cf[10047] is EMPTY OR cf[10527] is EMPTY OR cf[10058] is EMPTY)'
+    fields = f"summary,description,status,priority,labels,{RICE_REACH_FIELD},{RICE_IMPACT_FIELD},{RICE_CONFIDENCE_FIELD},{RICE_EFFORT_FIELD},{RICE_VALUE_FIELD},{ROADMAP_FIELD},{SWIMLANE_FIELD},{ADVISER_FIELD}"
+    issues, start_at = [], 0
+    while True:
+        data = jira_get("/rest/api/3/search/jql", params={"jql": jql, "fields": fields, "maxResults": 50, "startAt": start_at})
+        batch = data.get("issues", [])
+        total = data.get("total", 0)
+        issues.extend(batch)
+        if start_at + len(batch) >= total:
+            break
+        start_at += len(batch)
+    return issues
+
+
+def build_feedback_enrichment_prompt(issue):
+    """Build a prompt for Claude to clean up description and score RICE for a user feedback idea."""
+    f = issue["fields"]
+    summary = f["summary"]
+    desc = f.get("description") or ""
+    if isinstance(desc, dict):
+        desc = adf_to_text(desc)
+
+    return f"""You are a senior Product Manager for Axis CRM, a life insurance distribution CRM platform.
+The platform is used by AFSL-licensed insurance advisers to manage clients, policies, applications, quotes, payments and commissions.
+Partner insurers include TAL, Zurich, AIA, MLC Life, MetLife, Resolution Life, Integrity Life and others.
+The CRM serves multiple divisions: LIP (lead intake & processing) team, services team, and advisers.
+
+You are processing a User Feedback idea ticket from the Strategic Roadmap.
+
+TICKET: {issue["key"]}
+CURRENT SUMMARY: {summary}
+RAW DESCRIPTION:
+{desc}
+
+You must do two things:
+
+1. CLEAN UP THE DESCRIPTION:
+   - The description contains verbatim user feedback quotes. Keep them verbatim — do NOT change the user's words.
+   - Format each quote as: 💬 [Name]: "[exact quote text]"
+   - Fix punctuation, add proper apostrophes, but don't rephrase their words.
+   - If the raw text is "Name: some feedback text", convert to: 💬 Name: "some feedback text"
+   - If already formatted with 💬 or 🗣, normalise to 💬 format.
+   - Separate each quote with a blank line.
+   - Preserve the adviser's name from each quote.
+
+2. SCORE RICE (each 1-5):
+   - **Reach** (1-5): How many users does this affect? 1=very few, 2=some, 3=moderate, 4=many, 5=nearly all users
+   - **Impact** (1-5): How significant is the impact when it occurs? 1=minimal, 2=low, 3=moderate, 4=high, 5=critical/blocking
+   - **Confidence** (1-5): How confident are we this is a real problem? 1=speculative, 2=low evidence, 3=some evidence, 4=strong evidence, 5=validated by multiple users
+   - **Effort** (1-5): How much effort to solve? 1=trivial, 2=small, 3=medium, 4=large, 5=massive
+   
+   Consider: number of distinct users quoted (more = higher reach/confidence), severity of pain described,
+   whether it's a bug vs feature vs workflow issue, compliance/revenue impact, and implementation complexity.
+
+RESPOND IN EXACTLY THIS JSON FORMAT (no markdown fences, no extra text):
+{{
+  "cleaned_description": "<formatted quotes with 💬 Name: \\"quote\\" format, each separated by blank lines>",
+  "adviser_names": ["<list of adviser names extracted from quotes>"],
+  "rice_reach": <1-5>,
+  "rice_impact": <1-5>,
+  "rice_confidence": <1-5>,
+  "rice_effort": <1-5>,
+  "rice_reasoning": "<1-2 sentences explaining the scores>"
+}}"""
+
+
+def update_ar_idea(issue_key, cleaned_desc=None, rice_scores=None):
+    """Update an AR idea with cleaned description and/or RICE scores."""
+    payload = {"fields": {}}
+
+    if rice_scores:
+        payload["fields"][RICE_REACH_FIELD] = rice_scores.get("reach")
+        payload["fields"][RICE_IMPACT_FIELD] = rice_scores.get("impact")
+        payload["fields"][RICE_CONFIDENCE_FIELD] = rice_scores.get("confidence")
+        payload["fields"][RICE_EFFORT_FIELD] = rice_scores.get("effort")
+
+    if cleaned_desc:
+        payload["update"] = {"description": [{"set": {"version": 1, "type": "doc", "content": markdown_to_adf(cleaned_desc)}}]}
+
+    if not payload["fields"]:
+        del payload["fields"]
+
+    ok, r = jira_put(f"/rest/api/3/issue/{issue_key}", payload)
+    if not ok:
+        log.warning(f"Failed to update {issue_key}: {r.status_code} {r.text[:300]}")
+    return ok
+
+
+def prioritise_feedback_ideas():
+    """Re-prioritise all scored User Feedback ideas across Roadmap columns by RICE score."""
+    jql = f'project = {AR_PROJECT_KEY} AND cf[10694] = "User Feedback" AND cf[10526] is not EMPTY AND cf[10047] is not EMPTY AND cf[10527] is not EMPTY AND cf[10058] is not EMPTY'
+    fields = f"summary,{RICE_REACH_FIELD},{RICE_IMPACT_FIELD},{RICE_CONFIDENCE_FIELD},{RICE_EFFORT_FIELD},{ROADMAP_FIELD}"
+    issues, start_at = [], 0
+    while True:
+        data = jira_get("/rest/api/3/search/jql", params={"jql": jql, "fields": fields, "maxResults": 100, "startAt": start_at})
+        batch = data.get("issues", [])
+        total = data.get("total", 0)
+        issues.extend(batch)
+        if start_at + len(batch) >= total:
+            break
+        start_at += len(batch)
+
+    if not issues:
+        log.info("  No scored User Feedback ideas to prioritise.")
+        return
+
+    # Calculate RICE value for each and sort descending
+    for issue in issues:
+        f = issue["fields"]
+        r = f.get(RICE_REACH_FIELD) or 1
+        i = f.get(RICE_IMPACT_FIELD) or 1
+        c = f.get(RICE_CONFIDENCE_FIELD) or 1
+        e = f.get(RICE_EFFORT_FIELD) or 1
+        issue["_rice_value"] = (r * i * c) / e
+    issues.sort(key=lambda x: x["_rice_value"], reverse=True)
+
+    log.info(f"  Prioritising {len(issues)} scored User Feedback ideas across roadmap columns.")
+
+    # Assign to columns: first column gets 2-3 tickets, rest get up to IDEAS_PER_COLUMN
+    idx = 0
+    for col in ROADMAP_COLUMNS:
+        if idx >= len(issues):
+            break
+        slots = IDEAS_PER_COLUMN
+        assigned = 0
+        while idx < len(issues) and assigned < slots:
+            issue = issues[idx]
+            current_roadmap = (issue["fields"].get(ROADMAP_FIELD) or {}).get("id")
+            target_id = col["id"]
+            if current_roadmap != target_id:
+                ok, resp = jira_put(f"/rest/api/3/issue/{issue['key']}", {
+                    "fields": {ROADMAP_FIELD: {"id": target_id}}
+                })
+                if ok:
+                    log.info(f"    {issue['key']} (RICE={issue['_rice_value']:.1f}) → {col['value']}")
+                else:
+                    log.warning(f"    Failed to move {issue['key']} to {col['value']}: {resp.status_code}")
+            else:
+                log.info(f"    {issue['key']} (RICE={issue['_rice_value']:.1f}) already in {col['value']}")
+            idx += 1
+            assigned += 1
+
+    # Remaining ideas go to Backlog
+    while idx < len(issues):
+        issue = issues[idx]
+        current_roadmap = (issue["fields"].get(ROADMAP_FIELD) or {}).get("id")
+        if current_roadmap != ROADMAP_BACKLOG_ID:
+            ok, resp = jira_put(f"/rest/api/3/issue/{issue['key']}", {
+                "fields": {ROADMAP_FIELD: {"id": ROADMAP_BACKLOG_ID}}
+            })
+            if ok:
+                log.info(f"    {issue['key']} (RICE={issue['_rice_value']:.1f}) → Backlog")
+        idx += 1
+
+
+def process_user_feedback():
+    """JOB 6: Process User Feedback ideas — clean descriptions, score RICE, prioritise."""
+    if not ANTHROPIC_API_KEY:
+        log.info("JOB 6 skipped — ANTHROPIC_API_KEY not set.")
+        return
+
+    # Step 1: Find unscored User Feedback ideas
+    unscored = get_user_feedback_ideas(scored_only=False)
+    if unscored:
+        log.info(f"JOB 6: Found {len(unscored)} unscored User Feedback idea(s) to process.")
+        for issue in unscored:
+            key = issue["key"]
+            summary = issue["fields"]["summary"]
+            log.info(f"  Processing {key}: {summary}")
+
+            prompt = build_feedback_enrichment_prompt(issue)
+            response = call_claude(prompt)
+
+            if not response:
+                log.warning(f"  Skipping {key} — Claude enrichment failed.")
+                continue
+
+            try:
+                clean = re.sub(r'^```(?:json)?\s*', '', response)
+                clean = re.sub(r'\s*```$', '', clean)
+                enrichment = json.loads(clean)
+            except json.JSONDecodeError as e:
+                log.warning(f"  Skipping {key} — JSON parse error: {e}")
+                continue
+
+            cleaned_desc = enrichment.get("cleaned_description")
+            rice_scores = {
+                "reach": min(max(int(enrichment.get("rice_reach", 1)), 1), 5),
+                "impact": min(max(int(enrichment.get("rice_impact", 1)), 1), 5),
+                "confidence": min(max(int(enrichment.get("rice_confidence", 1)), 1), 5),
+                "effort": min(max(int(enrichment.get("rice_effort", 1)), 1), 5),
+            }
+            rice_val = (rice_scores["reach"] * rice_scores["impact"] * rice_scores["confidence"]) / rice_scores["effort"]
+
+            if update_ar_idea(key, cleaned_desc=cleaned_desc, rice_scores=rice_scores):
+                log.info(f"  Completed {key}: R={rice_scores['reach']} I={rice_scores['impact']} C={rice_scores['confidence']} E={rice_scores['effort']} → Value={rice_val:.1f}")
+            else:
+                log.warning(f"  Failed to update {key}")
+    else:
+        log.info("JOB 6: No unscored User Feedback ideas found.")
+
+    # Step 2: Re-prioritise ALL scored ideas across the roadmap
+    log.info("JOB 6: Re-prioritising User Feedback ideas across roadmap columns.")
+    prioritise_feedback_ideas()
+
+
 # ── Main run ──────────────────────────────────────────────────────────────────
 
 def run():
@@ -804,6 +1049,9 @@ def run():
 
         log.info("JOB 5: Enrich Ticket Descriptions")
         enrich_ticket_descriptions()
+
+        log.info("JOB 6: Process User Feedback Ideas")
+        process_user_feedback()
 
         log.info("=== Run complete ===")
     except Exception as e:
