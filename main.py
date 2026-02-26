@@ -1494,18 +1494,20 @@ def start_telegram_bot():
             else:
                 # It's a callout
                 if this_week_exists:
-                    # Page exists — add directly
-                    if add_callout_to_weekly(page_id, text):
+                    # Page exists — add directly (polished inside add_callout_to_weekly)
+                    polished = add_callout_to_weekly(page_id, text)
+                    if polished:
                         bot.send_message(message.chat.id,
-                            f"📢 Callout added to the page:\n_{text}_\n\nSend more or /done to finish.",
+                            f"📢 Callout added to the page:\n_{polished}_\n\nSend more or /done to finish.",
                             parse_mode="Markdown")
                     else:
                         bot.send_message(message.chat.id, "❌ Failed to add callout to the page.")
                 else:
-                    # Page not created yet — buffer for Friday 7am
-                    pending_weekly_callouts.append(text)
+                    # Page not created yet — polish and buffer for Friday 7am
+                    polished = polish_callout(text)
+                    pending_weekly_callouts.append(polished)
                     bot.send_message(message.chat.id,
-                        f"📢 Callout buffered for Friday's page:\n_{text}_\n"
+                        f"📢 Callout buffered for Friday's page:\n_{polished}_\n"
                         f"({len(pending_weekly_callouts)} callout(s) queued)\n\n"
                         f"Send more or /done to finish.",
                         parse_mode="Markdown")
@@ -2780,7 +2782,7 @@ def generate_product_weekly():
         if pending_weekly_callouts:
             log.info(f"JOB 14: Injecting {len(pending_weekly_callouts)} buffered callout(s)...")
             for callout in pending_weekly_callouts:
-                add_callout_to_weekly(new_page_id, callout)
+                add_callout_to_weekly(new_page_id, callout, already_polished=True)
             pending_weekly_callouts.clear()
 
         send_telegram(
@@ -2800,8 +2802,23 @@ def get_current_weekly_page():
     return page_id, title
 
 
-def add_callout_to_weekly(page_id, callout_text):
+def polish_callout(raw_text):
+    """Use Claude to polish raw Telegram text into professional meeting-ready language."""
+    prompt = (
+        "Rewrite the following rough note into a concise, professional callout suitable for a Product Weekly meeting page. "
+        "Keep it brief (1-2 sentences max). Preserve all key facts, names, and specifics. "
+        "Do not add any preamble or explanation — just return the polished text.\n\n"
+        f"Raw note: {raw_text}"
+    )
+    polished = call_claude(prompt, max_tokens=200)
+    return polished.strip() if polished else raw_text
+
+
+def add_callout_to_weekly(page_id, callout_text, already_polished=False):
     """Add a callout/note to the Insights section of the current Product Weekly page."""
+    # Polish the raw text into professional language
+    if not already_polished:
+        callout_text = polish_callout(callout_text)
     adf = get_page_adf(page_id)
     if not adf:
         return False
@@ -2844,7 +2861,9 @@ def add_callout_to_weekly(page_id, callout_text):
         },
         "version": {"number": version + 1, "message": "Added callout via Telegram"},
     })
-    return result is not None
+    if result is not None:
+        return callout_text  # Return polished text
+    return None
 
 
 def tick_action_item(page_id, item_index):
