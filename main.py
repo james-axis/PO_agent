@@ -1097,7 +1097,6 @@ def create_jpd_idea(structured_data):
         "summary": summary,
         "description": {"version": 1, "type": "doc", "content": markdown_to_adf(description_md)},
         "assignee": {"accountId": JAMES_ACCOUNT_ID},
-        "reporter": {"accountId": JAMES_ACCOUNT_ID},
         SWIMLANE_FIELD: {"id": STRATEGIC_INITIATIVES_ID},
     }
 
