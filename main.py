@@ -1357,9 +1357,38 @@ def start_telegram_bot():
         save_chat_id(message.chat.id)
         bot.send_message(message.chat.id, "📋 Loading Product Weekly actions...", parse_mode="Markdown")
 
-        page_id, title = get_current_weekly_page()
+        # Check if THIS week's page exists (i.e. for the upcoming/current Friday)
+        sydney_tz = pytz.timezone("Australia/Sydney")
+        now = datetime.now(sydney_tz)
+        # Find next Friday (or today if it's Friday)
+        days_until_friday = (4 - now.weekday()) % 7
+        if days_until_friday == 0 and now.hour < 7:
+            # It's Friday but before 7am — page hasn't been created yet
+            friday_date = now.date()
+        elif days_until_friday == 0:
+            friday_date = now.date()
+        else:
+            friday_date = (now + timedelta(days=days_until_friday)).date()
+
+        expected_title = f"{friday_date.strftime('%Y-%m-%d')} Product Weekly"
+
+        # Check if this week's page exists
+        existing = confluence_get("/rest/api/search", params={
+            "cql": f'ancestor = {WEEKLY_PARENT_PAGE_ID} AND type = page AND title = "{expected_title}"',
+            "limit": 1,
+        })
+        this_week_exists = existing and existing.get("results")
+
+        if this_week_exists:
+            # Page exists — normal flow
+            page_id = existing["results"][0]["content"]["id"]
+            title = existing["results"][0]["title"]
+        else:
+            # Page doesn't exist yet — use last week's for action review, buffer callouts
+            page_id, title = get_current_weekly_page()
+
         if not page_id:
-            bot.send_message(message.chat.id, "❌ No Product Weekly page found. It may not have been created yet.")
+            bot.send_message(message.chat.id, "❌ No Product Weekly page found.")
             return
 
         adf = get_page_adf(page_id)
@@ -1370,19 +1399,30 @@ def start_telegram_bot():
         items = extract_action_items_from_adf(adf)
 
         msg = f"📋 *{title}*\n\n"
+
+        if not this_week_exists:
+            msg += f"⏳ _This week's page ({expected_title}) will be created at 7am Friday._\n"
+            msg += f"_Callouts you send now will be added to the new page automatically._\n\n"
+
         if items:
-            msg += "*Actions:*\n"
+            msg += "*Actions from last meeting:*\n"
             for i, item in enumerate(items):
                 icon = "✅" if item["state"] == "DONE" else "⬜"
                 msg += f"{i+1}. {icon} {item['person']}: {item['text']}\n"
             msg += "\n*Reply with:*\n"
             msg += "• Numbers to mark done (e.g. `1 3`)\n"
-            msg += "• Text to add a callout to the page\n"
+            msg += "• Text to add a callout\n"
             msg += "• `/done` when finished"
         else:
-            msg += "No action items found.\n\n*Send text to add a callout to the page.*"
+            msg += "No action items found.\n\n*Send text to add a callout.*"
 
-        user_mode[message.chat.id] = {"mode": "weekly", "page_id": page_id, "title": title, "items": items}
+        user_mode[message.chat.id] = {
+            "mode": "weekly",
+            "page_id": page_id,
+            "title": title,
+            "items": items,
+            "this_week_exists": bool(this_week_exists),
+        }
         bot.send_message(message.chat.id, msg, parse_mode="Markdown")
 
     @bot.message_handler(commands=["done"])
@@ -1431,6 +1471,7 @@ def start_telegram_bot():
         if state.get("mode") == "weekly":
             page_id = state.get("page_id")
             items = state.get("items", [])
+            this_week_exists = state.get("this_week_exists", True)
             text = message.text.strip()
 
             # Check if it's numbers (marking actions complete)
@@ -1451,13 +1492,23 @@ def start_telegram_bot():
                 else:
                     bot.send_message(message.chat.id, "Those items were already done or invalid.")
             else:
-                # It's a callout — add to the Insights section
-                if add_callout_to_weekly(page_id, text):
-                    bot.send_message(message.chat.id,
-                        f"📢 Callout added to the page:\n_{text}_\n\nSend more or /done to finish.",
-                        parse_mode="Markdown")
+                # It's a callout
+                if this_week_exists:
+                    # Page exists — add directly
+                    if add_callout_to_weekly(page_id, text):
+                        bot.send_message(message.chat.id,
+                            f"📢 Callout added to the page:\n_{text}_\n\nSend more or /done to finish.",
+                            parse_mode="Markdown")
+                    else:
+                        bot.send_message(message.chat.id, "❌ Failed to add callout to the page.")
                 else:
-                    bot.send_message(message.chat.id, "❌ Failed to add callout to the page.")
+                    # Page not created yet — buffer for Friday 7am
+                    pending_weekly_callouts.append(text)
+                    bot.send_message(message.chat.id,
+                        f"📢 Callout buffered for Friday's page:\n_{text}_\n"
+                        f"({len(pending_weekly_callouts)} callout(s) queued)\n\n"
+                        f"Send more or /done to finish.",
+                        parse_mode="Markdown")
         elif state["mode"] == "backlog":
             process_telegram_work(message.text, message.chat.id, bot)
         else:
@@ -2367,6 +2418,7 @@ Verify all split tickets pass their individual acceptance criteria.
 WEEKLY_PARENT_PAGE_ID = "103645185"   # "Checkins" parent page
 WEEKLY_SPACE_ID = "1933317"           # CAD space ID
 WEEKLY_SPACE_KEY = "CAD"
+pending_weekly_callouts = []          # Buffer for callouts added before page is created
 
 
 def confluence_get(path, params=None):
@@ -2753,6 +2805,14 @@ def generate_product_weekly():
         web_url = result.get("_links", {}).get("webui", "")
         full_url = f"{CONFLUENCE_BASE}{web_url}" if web_url else f"{JIRA_BASE_URL}/wiki/spaces/{WEEKLY_SPACE_KEY}/pages/{new_page_id}"
         log.info(f"JOB 14: Created '{page_title}' — {full_url}")
+
+        # Inject any buffered callouts from Telegram
+        if pending_weekly_callouts:
+            log.info(f"JOB 14: Injecting {len(pending_weekly_callouts)} buffered callout(s)...")
+            for callout in pending_weekly_callouts:
+                add_callout_to_weekly(new_page_id, callout)
+            pending_weekly_callouts.clear()
+
         send_telegram(
             f"📋 *Product Weekly* created for {meeting_date.strftime('%d %b %Y')}:\n"
             f"{full_url}\n\n"
