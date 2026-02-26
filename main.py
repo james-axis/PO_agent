@@ -4,6 +4,7 @@ import json
 import requests
 import logging
 from datetime import datetime, timedelta
+from uuid import uuid4
 from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.cron import CronTrigger
 import pytz
@@ -1326,7 +1327,8 @@ def start_telegram_bot():
             "👋 *Alfred — Axis CRM Bot*\n\n"
             "*🧠 /strategic* — Create idea → Strategic Initiatives swimlane\n"
             "*💬 /feedback* — Create idea → User Feedback swimlane\n"
-            "*🔨 /backlog* — Create Epic + broken-down tickets in Sprints\n\n"
+            "*🔨 /backlog* — Create Epic + broken-down tickets in Sprints\n"
+            "*📋 /productweekly* — Review actions & add callouts to weekly meeting\n\n"
             "Send a text or voice note after selecting a mode.\n"
             "Default mode: /strategic",
             parse_mode="Markdown"
@@ -1349,6 +1351,49 @@ def start_telegram_bot():
         save_chat_id(message.chat.id)
         user_mode[message.chat.id] = {"mode": "backlog", "swimlane": STRATEGIC_INITIATIVES_ID}
         bot.reply_to(message, "🔨 *Backlog mode* — describe what needs building.", parse_mode="Markdown")
+
+    @bot.message_handler(commands=["productweekly"])
+    def handle_product_weekly(message):
+        save_chat_id(message.chat.id)
+        bot.send_message(message.chat.id, "📋 Loading Product Weekly actions...", parse_mode="Markdown")
+
+        page_id, title = get_current_weekly_page()
+        if not page_id:
+            bot.send_message(message.chat.id, "❌ No Product Weekly page found. It may not have been created yet.")
+            return
+
+        adf = get_page_adf(page_id)
+        if not adf:
+            bot.send_message(message.chat.id, "❌ Failed to load the page.")
+            return
+
+        items = extract_action_items_from_adf(adf)
+
+        msg = f"📋 *{title}*\n\n"
+        if items:
+            msg += "*Actions:*\n"
+            for i, item in enumerate(items):
+                icon = "✅" if item["state"] == "DONE" else "⬜"
+                msg += f"{i+1}. {icon} {item['person']}: {item['text']}\n"
+            msg += "\n*Reply with:*\n"
+            msg += "• Numbers to mark done (e.g. `1 3`)\n"
+            msg += "• Text to add a callout to the page\n"
+            msg += "• `/done` when finished"
+        else:
+            msg += "No action items found.\n\n*Send text to add a callout to the page.*"
+
+        user_mode[message.chat.id] = {"mode": "weekly", "page_id": page_id, "title": title, "items": items}
+        bot.send_message(message.chat.id, msg, parse_mode="Markdown")
+
+    @bot.message_handler(commands=["done"])
+    def handle_done(message):
+        save_chat_id(message.chat.id)
+        state = user_mode.get(message.chat.id, {})
+        if state.get("mode") == "weekly":
+            user_mode[message.chat.id] = {"mode": "roadmap", "swimlane": STRATEGIC_INITIATIVES_ID}
+            bot.reply_to(message, "✅ Product Weekly session finished.", parse_mode="Markdown")
+        else:
+            bot.reply_to(message, "Nothing to finish. Use /help for commands.")
 
     @bot.message_handler(content_types=["voice"])
     def handle_voice(message):
@@ -1379,10 +1424,41 @@ def start_telegram_bot():
     def handle_text(message):
         save_chat_id(message.chat.id)
         if message.text.startswith("/"):
-            bot.reply_to(message, "Unknown command. Try /strategic, /feedback, /backlog, or /help")
+            bot.reply_to(message, "Unknown command. Try /strategic, /feedback, /backlog, /productweekly, or /help")
             return
         state = user_mode.get(message.chat.id, {"mode": "roadmap", "swimlane": STRATEGIC_INITIATIVES_ID})
-        if state["mode"] == "backlog":
+
+        if state.get("mode") == "weekly":
+            page_id = state.get("page_id")
+            items = state.get("items", [])
+            text = message.text.strip()
+
+            # Check if it's numbers (marking actions complete)
+            parts = text.replace(",", " ").split()
+            if all(p.isdigit() for p in parts) and parts:
+                completed = []
+                for p in parts:
+                    idx = int(p) - 1  # 1-indexed to 0-indexed
+                    if 0 <= idx < len(items) and items[idx]["state"] == "TODO":
+                        if tick_action_item(page_id, idx):
+                            items[idx]["state"] = "DONE"
+                            completed.append(items[idx]["text"])
+                if completed:
+                    bot.send_message(message.chat.id,
+                        f"✅ Marked as done:\n" + "\n".join(f"• {c}" for c in completed) +
+                        "\n\nSend more numbers, text for callouts, or /done to finish.",
+                        parse_mode="Markdown")
+                else:
+                    bot.send_message(message.chat.id, "Those items were already done or invalid.")
+            else:
+                # It's a callout — add to the Insights section
+                if add_callout_to_weekly(page_id, text):
+                    bot.send_message(message.chat.id,
+                        f"📢 Callout added to the page:\n_{text}_\n\nSend more or /done to finish.",
+                        parse_mode="Markdown")
+                else:
+                    bot.send_message(message.chat.id, "❌ Failed to add callout to the page.")
+        elif state["mode"] == "backlog":
             process_telegram_work(message.text, message.chat.id, bot)
         else:
             process_telegram_idea(message.text, message.chat.id, bot, swimlane_id=state["swimlane"])
@@ -2284,6 +2360,509 @@ Verify all split tickets pass their individual acceptance criteria.
         )
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# JOB 14: Product Weekly Meeting Minutes (Confluence)
+# ══════════════════════════════════════════════════════════════════════════════
+
+WEEKLY_PARENT_PAGE_ID = "103645185"   # "Checkins" parent page
+WEEKLY_SPACE_ID = "1933317"           # CAD space ID
+WEEKLY_SPACE_KEY = "CAD"
+
+
+def confluence_get(path, params=None):
+    """GET request to Confluence REST API."""
+    r = requests.get(f"{CONFLUENCE_BASE}{path}", auth=auth, headers=headers, params=params, timeout=30)
+    if r.status_code == 200:
+        return r.json()
+    log.warning(f"Confluence GET {path} → {r.status_code}: {r.text[:300]}")
+    return None
+
+
+def confluence_post(path, payload):
+    """POST request to Confluence REST API."""
+    r = requests.post(f"{CONFLUENCE_BASE}{path}", auth=auth, headers=headers, json=payload, timeout=30)
+    if r.status_code in (200, 201):
+        return r.json()
+    log.error(f"Confluence POST {path} → {r.status_code}: {r.text[:500]}")
+    return None
+
+
+def confluence_put(path, payload):
+    """PUT request to Confluence REST API."""
+    r = requests.put(f"{CONFLUENCE_BASE}{path}", auth=auth, headers=headers, json=payload, timeout=30)
+    if r.status_code == 200:
+        return r.json()
+    log.error(f"Confluence PUT {path} → {r.status_code}: {r.text[:500]}")
+    return None
+
+
+def get_latest_product_weekly_page():
+    """Find the most recent Product Weekly page under Checkins."""
+    data = confluence_get("/rest/api/search", params={
+        "cql": f'ancestor = {WEEKLY_PARENT_PAGE_ID} AND type = page AND title ~ "Product Weekly" ORDER BY created DESC',
+        "limit": 1,
+    })
+    if data and data.get("results"):
+        page_id = data["results"][0]["content"]["id"]
+        title = data["results"][0]["title"]
+        return page_id, title
+    return None, None
+
+
+def get_page_adf(page_id):
+    """Fetch a Confluence page's body in ADF format."""
+    data = confluence_get(f"/api/v2/pages/{page_id}", params={"body-format": "atlas_doc_format"})
+    if data:
+        adf_str = data.get("body", {}).get("atlas_doc_format", {}).get("value", "")
+        if adf_str:
+            return json.loads(adf_str) if isinstance(adf_str, str) else adf_str
+    return None
+
+
+def get_sprint_details_for_weekly():
+    """Get active + next sprint details for the weekly meeting page."""
+    active = get_active_sprint()
+    if not active:
+        return {"active": None, "next": None}
+
+    sprint = active[0]
+    sid = sprint["id"]
+    issues = jira_get(f"/rest/agile/1.0/sprint/{sid}/issue", params={
+        "fields": f"summary,status,issuetype,parent,{STORY_POINTS_FIELD}",
+        "maxResults": 200,
+    }).get("issues", [])
+
+    done, in_progress, ready, todo = [], [], [], []
+    total_pts, done_pts = 0, 0
+    for i in issues:
+        f = i["fields"]
+        pts = f.get(STORY_POINTS_FIELD) or 0
+        status = (f.get("status") or {}).get("name", "")
+        total_pts += pts
+        entry = {"key": i["key"], "summary": f.get("summary", ""), "pts": pts, "status": status,
+                 "type": f.get("issuetype", {}).get("name", ""),
+                 "epic": (f.get("parent") or {}).get("fields", {}).get("summary", "")}
+        if status.lower() in COMPLETED_STATUSES:
+            done.append(entry)
+            done_pts += pts
+        elif status.lower() == "in progress":
+            in_progress.append(entry)
+        elif status.lower() == "ready":
+            ready.append(entry)
+        else:
+            todo.append(entry)
+
+    # Next sprint
+    future = get_future_sprints()
+    next_sprint = None
+    if future:
+        ns = future[0]
+        ns_issues = jira_get(f"/rest/agile/1.0/sprint/{ns['id']}/issue", params={
+            "fields": f"summary,status,issuetype,parent,{STORY_POINTS_FIELD}",
+            "maxResults": 200,
+        }).get("issues", [])
+        next_sprint = {
+            "name": ns["name"],
+            "start": ns.get("startDate", ""),
+            "end": ns.get("endDate", ""),
+            "issues": [{"key": i["key"], "summary": i["fields"].get("summary", ""),
+                        "pts": i["fields"].get(STORY_POINTS_FIELD) or 0,
+                        "type": i["fields"].get("issuetype", {}).get("name", ""),
+                        "epic": (i["fields"].get("parent") or {}).get("fields", {}).get("summary", "")}
+                       for i in ns_issues],
+        }
+
+    return {
+        "active": {
+            "name": sprint["name"],
+            "start": sprint.get("startDate", ""),
+            "end": sprint.get("endDate", ""),
+            "total_pts": total_pts,
+            "done_pts": done_pts,
+            "done": done,
+            "in_progress": in_progress,
+            "ready": ready,
+            "todo": todo,
+        },
+        "next": next_sprint,
+    }
+
+
+def extract_action_items_from_adf(adf):
+    """Extract action items (taskItems) from the Actions row of table 1."""
+    items = []
+    try:
+        table1 = adf["content"][1]  # First table
+        actions_row = table1["content"][2]  # Third row = Actions
+        actions_cell = actions_row["content"][1]  # Second cell = content
+
+        current_person = ""
+        for node in actions_cell.get("content", []):
+            if node["type"] == "paragraph":
+                text = ""
+                for c in node.get("content", []):
+                    text += c.get("text", "")
+                if text.strip():
+                    current_person = text.strip()
+            elif node["type"] == "taskList":
+                for task in node.get("content", []):
+                    if task["type"] == "taskItem":
+                        task_text = ""
+                        for c in task.get("content", []):
+                            task_text += c.get("text", "")
+                        items.append({
+                            "text": task_text.strip(),
+                            "state": task["attrs"].get("state", "TODO"),
+                            "person": current_person,
+                            "localId": task["attrs"].get("localId", ""),
+                        })
+    except (IndexError, KeyError) as e:
+        log.warning(f"Failed to extract action items: {e}")
+    return items
+
+
+def update_adf_for_new_week(adf, meeting_date, sprint_data, claude_updates):
+    """Modify a duplicated ADF body for the new week's meeting."""
+    import copy
+    new_adf = copy.deepcopy(adf)
+
+    # 1. Update date paragraph (first node)
+    try:
+        date_para = new_adf["content"][0]
+        for node in date_para.get("content", []):
+            if node.get("type") == "date":
+                # Timestamp in milliseconds
+                ts = int(meeting_date.timestamp() * 1000)
+                node["attrs"]["timestamp"] = str(ts)
+    except (IndexError, KeyError):
+        pass
+
+    # 2. Update Actions row — carry over TODO items only
+    try:
+        table1 = new_adf["content"][1]
+        actions_row = table1["content"][2]
+        actions_cell = actions_row["content"][1]
+
+        # Build new actions content: keep TODO items, drop DONE
+        new_content = []
+        current_person_node = None
+        current_tasks = []
+
+        for node in actions_cell.get("content", []):
+            if node["type"] == "paragraph":
+                # If we had accumulated tasks for a previous person, flush them
+                if current_person_node and current_tasks:
+                    new_content.append(current_person_node)
+                    new_content.append({"type": "taskList", "attrs": {"localId": str(uuid4())[:12]},
+                                        "content": current_tasks})
+                elif current_person_node:
+                    pass  # Person with no remaining tasks — skip
+                current_person_node = copy.deepcopy(node)
+                current_tasks = []
+            elif node["type"] == "taskList":
+                for task in node.get("content", []):
+                    if task.get("type") == "taskItem" and task.get("attrs", {}).get("state") == "TODO":
+                        current_tasks.append(copy.deepcopy(task))
+
+        # Flush last person
+        if current_person_node and current_tasks:
+            new_content.append(current_person_node)
+            new_content.append({"type": "taskList", "attrs": {"localId": str(uuid4())[:12]},
+                                "content": current_tasks})
+
+        # If no carried-over actions, add placeholder
+        if not new_content:
+            new_content = [{"type": "paragraph", "attrs": {"localId": str(uuid4())[:12]},
+                            "content": [{"type": "text", "text": "No actions carried over."}]}]
+
+        actions_cell["content"] = new_content
+    except (IndexError, KeyError) as e:
+        log.warning(f"Failed to update actions: {e}")
+
+    # 3. Update sprint goal row (row 5 of table 1)
+    try:
+        goal_cell = table1["content"][5]["content"][1]  # Second cell of sprint goal row
+        goal_text = claude_updates.get("sprint_goal", "")
+        if goal_text:
+            goal_cell["content"] = [{"type": "paragraph", "attrs": {"localId": str(uuid4())[:12]},
+                                     "content": [{"type": "text", "text": goal_text}]}]
+    except (IndexError, KeyError) as e:
+        log.warning(f"Failed to update sprint goal: {e}")
+
+    # 4. Update Insights row (row 0 of table 2) — add sprint progress summary
+    try:
+        table2 = new_adf["content"][2]
+        insights_cell = table2["content"][0]["content"][1]  # Second cell of Insights row
+        progress_text = claude_updates.get("insights", "Sprint progress update will be added during the meeting.")
+        progress_nodes = []
+        for para in progress_text.split("\n\n"):
+            if para.strip():
+                progress_nodes.append({"type": "paragraph", "attrs": {"localId": str(uuid4())[:12]},
+                                        "content": [{"type": "text", "text": para.strip()}]})
+        if progress_nodes:
+            insights_cell["content"] = progress_nodes
+    except (IndexError, KeyError) as e:
+        log.warning(f"Failed to update insights: {e}")
+
+    # 5. Reset Blocked row (row 1 of table 2)
+    try:
+        blocked_cell = table2["content"][1]["content"][1]  # Second cell of Blocked row
+        blocked_cell["content"] = [{"type": "bulletList", "attrs": {"localId": str(uuid4())[:12]},
+                                    "content": [{"type": "listItem", "attrs": {"localId": str(uuid4())[:12]},
+                                                  "content": [{"type": "paragraph",
+                                                               "attrs": {"localId": str(uuid4())[:12]},
+                                                               "content": [{"type": "text", "text": "N/A "}]}]}]}]
+    except (IndexError, KeyError):
+        pass
+
+    return new_adf
+
+
+def build_weekly_update_prompt(sprint_data, last_page_title):
+    """Build Claude prompt to generate sprint goal and insights for the weekly page."""
+    active = sprint_data.get("active")
+    next_sp = sprint_data.get("next")
+
+    active_summary = "No active sprint."
+    if active:
+        pct = int(active["done_pts"] / active["total_pts"] * 100) if active["total_pts"] > 0 else 0
+        done_list = "\n".join(f"  ✅ {t['key']}: {t['summary']} ({t['pts']}SP)" for t in active["done"])
+        ip_list = "\n".join(f"  🔄 {t['key']}: {t['summary']} ({t['pts']}SP)" for t in active["in_progress"])
+        ready_list = "\n".join(f"  📋 {t['key']}: {t['summary']} ({t['pts']}SP)" for t in active["ready"])
+        active_summary = f"""ACTIVE SPRINT: {active['name']}
+Progress: {pct}% ({active['done_pts']:.0f}/{active['total_pts']:.0f} SP)
+Start: {active['start'][:10] if active['start'] else 'N/A'} → End: {active['end'][:10] if active['end'] else 'N/A'}
+
+Done ({len(active['done'])}):
+{done_list or '  (none)'}
+
+In Progress ({len(active['in_progress'])}):
+{ip_list or '  (none)'}
+
+Ready ({len(active['ready'])}):
+{ready_list or '  (none)'}"""
+
+    next_summary = "No upcoming sprint."
+    if next_sp:
+        next_issues = "\n".join(f"  📌 {t['key']}: {t['summary']} ({t['pts']}SP) [{t['epic'] or 'No epic'}]"
+                                for t in next_sp["issues"][:15])
+        next_summary = f"""NEXT SPRINT: {next_sp['name']}
+Start: {next_sp['start'][:10] if next_sp['start'] else 'N/A'} → End: {next_sp['end'][:10] if next_sp['end'] else 'N/A'}
+Tickets ({len(next_sp['issues'])}):
+{next_issues}"""
+
+    return f"""You are preparing the weekly product meeting notes for Axis CRM.
+Axis CRM is a life insurance distribution CRM platform built with Django/Python, used by AFSL-licensed insurance advisers.
+
+Generate two things:
+
+1. SPRINT_GOAL: A concise one-line sprint goal using an emoji colour indicator and a brief description.
+Use these emoji indicators:
+- 🟢 On track / healthy
+- 🟡 Minor risks / slightly behind
+- 🔴 Blocked / significantly behind
+Example: "🟢 Complete payments dashboard v1.1 and begin adviser payments view."
+
+2. INSIGHTS: A 2-3 paragraph progress summary covering:
+- What was completed this sprint (key deliverables)
+- What's currently in progress
+- What's coming in the next sprint
+- Any notable patterns or risks
+
+Keep it professional but conversational — this is for a leadership audience.
+
+{active_summary}
+
+{next_summary}
+
+Previous meeting: {last_page_title}
+
+RESPOND IN EXACTLY THIS JSON FORMAT (no markdown fences):
+{{
+  "sprint_goal": "<emoji + one-line goal>",
+  "insights": "<2-3 paragraph summary>"
+}}"""
+
+
+def generate_product_weekly():
+    """JOB 14: Generate weekly product meeting Confluence page."""
+    log.info("JOB 14: Generating Product Weekly page...")
+
+    sydney_tz = pytz.timezone("Australia/Sydney")
+    now = datetime.now(sydney_tz)
+    meeting_date = now.date()
+    page_title = f"{meeting_date.strftime('%Y-%m-%d')} Product Weekly"
+
+    # Check if page already exists for this date
+    existing = confluence_get("/rest/api/search", params={
+        "cql": f'ancestor = {WEEKLY_PARENT_PAGE_ID} AND type = page AND title = "{page_title}"',
+        "limit": 1,
+    })
+    if existing and existing.get("results"):
+        log.info(f"JOB 14: Page '{page_title}' already exists. Skipping.")
+        return existing["results"][0]["content"]["id"]
+
+    # Get the most recent Product Weekly page to duplicate
+    last_page_id, last_title = get_latest_product_weekly_page()
+    if not last_page_id:
+        log.error("JOB 14: No previous Product Weekly page found to duplicate.")
+        return None
+
+    log.info(f"JOB 14: Duplicating from '{last_title}' (ID: {last_page_id})")
+
+    # Get ADF body
+    adf = get_page_adf(last_page_id)
+    if not adf:
+        log.error("JOB 14: Failed to fetch ADF body.")
+        return None
+
+    # Get sprint data
+    sprint_data = get_sprint_details_for_weekly()
+
+    # Call Claude for sprint goal and insights
+    claude_updates = {"sprint_goal": "", "insights": ""}
+    if ANTHROPIC_API_KEY:
+        prompt = build_weekly_update_prompt(sprint_data, last_title)
+        response = call_claude(prompt, max_tokens=1500)
+        if response:
+            try:
+                clean = re.sub(r'^```(?:json)?\s*', '', response)
+                clean = re.sub(r'\s*```$', '', clean)
+                claude_updates = json.loads(clean)
+            except json.JSONDecodeError as e:
+                log.warning(f"JOB 14: Claude JSON parse error: {e}")
+
+    # Update ADF for new week
+    meeting_dt = datetime.combine(meeting_date, datetime.min.time())
+    new_adf = update_adf_for_new_week(adf, meeting_dt, sprint_data, claude_updates)
+
+    # Create the page via Confluence v2 API
+    payload = {
+        "spaceId": WEEKLY_SPACE_ID,
+        "status": "current",
+        "title": page_title,
+        "parentId": WEEKLY_PARENT_PAGE_ID,
+        "body": {
+            "representation": "atlas_doc_format",
+            "value": json.dumps(new_adf),
+        },
+    }
+    result = confluence_post("/api/v2/pages", payload)
+    if result:
+        new_page_id = result.get("id", "?")
+        web_url = result.get("_links", {}).get("webui", "")
+        full_url = f"{CONFLUENCE_BASE}{web_url}" if web_url else f"{JIRA_BASE_URL}/wiki/spaces/{WEEKLY_SPACE_KEY}/pages/{new_page_id}"
+        log.info(f"JOB 14: Created '{page_title}' — {full_url}")
+        send_telegram(
+            f"📋 *Product Weekly* created for {meeting_date.strftime('%d %b %Y')}:\n"
+            f"{full_url}\n\n"
+            f"Use /productweekly to review actions and add callouts."
+        )
+        return new_page_id
+    else:
+        log.error("JOB 14: Failed to create Product Weekly page.")
+        return None
+
+
+def get_current_weekly_page():
+    """Find this week's Product Weekly page (most recent one)."""
+    page_id, title = get_latest_product_weekly_page()
+    return page_id, title
+
+
+def add_callout_to_weekly(page_id, callout_text):
+    """Add a callout/note to the Insights section of the current Product Weekly page."""
+    adf = get_page_adf(page_id)
+    if not adf:
+        return False
+
+    import copy
+    new_adf = copy.deepcopy(adf)
+
+    try:
+        table2 = new_adf["content"][2]
+        insights_cell = table2["content"][0]["content"][1]  # Second cell of Insights row
+
+        # Prepend the callout as a highlighted paragraph at the top
+        callout_node = {
+            "type": "paragraph",
+            "attrs": {"localId": str(uuid4())[:12]},
+            "content": [
+                {"type": "text", "text": "📢 ", "marks": []},
+                {"type": "text", "text": callout_text, "marks": [{"type": "strong"}]},
+            ]
+        }
+        insights_cell["content"].insert(0, callout_node)
+    except (IndexError, KeyError) as e:
+        log.warning(f"Failed to add callout: {e}")
+        return False
+
+    # Get current version for update
+    page_data = confluence_get(f"/api/v2/pages/{page_id}", params={"body-format": "atlas_doc_format"})
+    if not page_data:
+        return False
+    version = page_data.get("version", {}).get("number", 1)
+
+    result = confluence_put(f"/api/v2/pages/{page_id}", {
+        "id": page_id,
+        "status": "current",
+        "title": page_data.get("title", ""),
+        "spaceId": WEEKLY_SPACE_ID,
+        "body": {
+            "representation": "atlas_doc_format",
+            "value": json.dumps(new_adf),
+        },
+        "version": {"number": version + 1, "message": "Added callout via Telegram"},
+    })
+    return result is not None
+
+
+def tick_action_item(page_id, item_index):
+    """Mark an action item as DONE on the Product Weekly page."""
+    adf = get_page_adf(page_id)
+    if not adf:
+        return False
+
+    import copy
+    new_adf = copy.deepcopy(adf)
+
+    try:
+        table1 = new_adf["content"][1]
+        actions_cell = table1["content"][2]["content"][1]
+
+        # Find all taskItems
+        task_count = 0
+        for node in actions_cell.get("content", []):
+            if node["type"] == "taskList":
+                for task in node.get("content", []):
+                    if task.get("type") == "taskItem":
+                        if task_count == item_index:
+                            task["attrs"]["state"] = "DONE"
+                            break
+                        task_count += 1
+    except (IndexError, KeyError) as e:
+        log.warning(f"Failed to tick action item: {e}")
+        return False
+
+    page_data = confluence_get(f"/api/v2/pages/{page_id}", params={"body-format": "atlas_doc_format"})
+    if not page_data:
+        return False
+    version = page_data.get("version", {}).get("number", 1)
+
+    result = confluence_put(f"/api/v2/pages/{page_id}", {
+        "id": page_id,
+        "status": "current",
+        "title": page_data.get("title", ""),
+        "spaceId": WEEKLY_SPACE_ID,
+        "body": {
+            "representation": "atlas_doc_format",
+            "value": json.dumps(new_adf),
+        },
+        "version": {"number": version + 1, "message": "Action item completed via Telegram"},
+    })
+    return result is not None
+
+
 def run():
     log.info("=== Starting Jira prioritisation run ===")
     try:
@@ -2347,6 +2926,8 @@ def run():
         log.info("JOB 13: Micro-Decomposition")
         micro_decompose_tickets()
 
+        # JOB 14 runs on its own Friday schedule, not in the core loop
+
         log.info("=== Run complete ===")
     except Exception as e:
         log.error(f"Run failed: {e}", exc_info=True)
@@ -2382,7 +2963,15 @@ if __name__ == "__main__":
         name="EOD Summary",
     )
 
-    log.info("Scheduler started — core loop every 30min (7am-6pm), briefing 7:30am, EOD 5pm AEDT Mon-Fri.")
+    # Product Weekly — 7:00am Friday
+    scheduler.add_job(
+        generate_product_weekly,
+        trigger=CronTrigger(day_of_week="fri", hour=7, minute=0, timezone=sydney_tz),
+        id="product_weekly",
+        name="Product Weekly (Friday 7am)",
+    )
+
+    log.info("Scheduler started — core loop every 30min (7am-6pm), briefing 7:30am, EOD 5pm, Product Weekly Fri 7am AEDT.")
     discover_reviewed_field()
 
     # Start Telegram bot in a daemon thread (runs alongside scheduler)
