@@ -2061,9 +2061,7 @@ def run_board_monitor():
 
     # Send consolidated alerts
     if alerts:
-        msg = "🤖 *Board Monitor*\n\n" + "\n".join(alerts)
-        send_telegram(msg)
-        log.info(f"JOB 11: Sent {len(alerts)} alerts to Telegram.")
+        log.info(f"JOB 11: {len(alerts)} alert(s) found (logged only, no Telegram).")
     else:
         log.info("JOB 11: All clear — no issues found.")
 
@@ -2120,7 +2118,7 @@ def archive_old_backlog():
                 log.warning(f"  Failed to archive {key}: {e}")
 
         if archived > 0:
-            send_telegram(f"🗄 *Archived {archived} tickets* older than {ARCHIVE_AGE_DAYS} days from backlog → {ARCHIVE_PROJECT_KEY}")
+            log.info(f"JOB 12: Archived {archived} tickets to {ARCHIVE_PROJECT_KEY}.")
 
     except Exception as e:
         log.error(f"JOB 12 failed: {e}", exc_info=True)
@@ -2397,10 +2395,7 @@ def micro_decompose_tickets():
     log.info(f"JOB 13: Micro-decomposed {processed} ticket(s).")
 
     if processed > 0:
-        send_telegram(
-            f"🔬 *Micro-Decomposition*: Split {processed} ticket(s) into "
-            f"0.5-1 SP standalone tickets for smoother burndown."
-        )
+        log.info(f"JOB 13: Split {processed} ticket(s) into standalone tickets.")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -3027,7 +3022,7 @@ if __name__ == "__main__":
     # EOD summary — 5:00pm Mon-Fri
     scheduler.add_job(
         send_eod_summary,
-        trigger=CronTrigger(day_of_week="mon-fri", hour=17, minute=0, timezone=sydney_tz),
+        trigger=CronTrigger(day_of_week="mon-fri", hour=17, minute=30, timezone=sydney_tz),
         id="eod_summary",
         name="EOD Summary",
     )
@@ -3040,7 +3035,7 @@ if __name__ == "__main__":
         name="Product Weekly (Friday 7am)",
     )
 
-    log.info("Scheduler started — core loop every 30min (7am-6pm), briefing 7:30am, EOD 5pm, Product Weekly Fri 7am AEDT.")
+    log.info("Scheduler started — core loop every 30min (7am-6pm), briefing 7:30am, EOD 5:30pm, Product Weekly Fri 7am AEDT.")
     discover_reviewed_field()
 
     # Start Telegram bot in a daemon thread (runs alongside scheduler)
