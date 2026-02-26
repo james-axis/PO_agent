@@ -1044,9 +1044,7 @@ def process_user_feedback():
 
 def build_idea_extraction_prompt(user_text):
     """Build the Claude prompt to structure a Telegram message into a JPD idea."""
-    roadmap_cols = ", ".join(f'"{col["value"]}"' for col in ROADMAP_COLUMNS)
-    initiative_names = ", ".join(f'"{k.title()}"' for k in INITIATIVE_OPTIONS if k not in ("mvp", "iteration", "modules", "workflows", "features"))
-    scope_tags = '"MVP", "Iteration", "Modules", "Workflows", "Features"'
+    initiative_modules = ", ".join(f'"{k.title()}"' for k in INITIATIVE_OPTIONS if k not in ("mvp", "iteration", "modules", "workflows", "features"))
     product_cats = ", ".join(f'"{k.title()}"' for k in PRODUCT_CATEGORY_OPTIONS)
 
     return f"""You are a senior Product Manager for Axis CRM, a life insurance distribution CRM platform.
@@ -1064,9 +1062,10 @@ Respond with ONLY a JSON object (no markdown, no backticks, no explanation):
 {{
   "summary": "Concise idea title (3-8 words)",
   "description": "**Outcome we want to achieve**\\n\\n[Clear, specific outcome with measurable targets where possible.]\\n\\n**Why it's a problem**\\n\\n[Current pain point, inefficiency, or gap. Include evidence where available.]\\n\\n**How it gets us closer to our vision: The Adviser CRM that enables workflow and pipeline visibility, client engagement and compliance through intelligent automation.**\\n\\n[Connect to vision — workflow/pipeline visibility, client engagement, compliance, or intelligent automation.]\\n\\n**How it improves our north star: Total submissions**\\n\\n[Specific causal chain explaining how this increases total submissions.]",
-  "roadmap_column": "[One of: {roadmap_cols}, or null if not specified]",
-  "initiative": ["[Primary module/feature]", "[Scope tag if clear, e.g. MVP/Features/Modules]"],
-  "labels": ["Features"],
+  "initiative_module": "[Primary module/feature — select ONE from the list below]",
+  "initiative_stage": "[MVP or Iteration]",
+  "initiative_scope": "[Modules or Features]",
+  "labels": "[Modules or Features — pick the one that matches initiative_scope]",
   "product_category": "[One of: {product_cats}, or null]",
   "discovery": "Validate",
   "rice_reach": [1-5 estimate],
@@ -1078,11 +1077,14 @@ Respond with ONLY a JSON object (no markdown, no backticks, no explanation):
 RULES:
 - Write the description as a thoughtful PM would — substantive, not just parroting the input.
 - The four description sections are MANDATORY. Fill them all in based on the context.
-- For initiative, select from: {initiative_names}. Add a scope tag from {scope_tags} if it's clear.
-- For roadmap_column, ONLY set it if the user explicitly mentions a sprint/column (e.g. "March S2", "April sprint 1"). Use null if not mentioned.
+- INITIATIVE must always have exactly 3 values:
+  1. initiative_module: The primary module or feature. Select ONE from: {initiative_modules}
+  2. initiative_stage: Either "MVP" (new capability) or "Iteration" (improving existing). Pick based on context.
+  3. initiative_scope: Either "Modules" (if it's a full module/screen) or "Features" (if it's a feature within a module).
+- LABELS: Must be either "Modules" or "Features" — match whichever you picked for initiative_scope.
+- ROADMAP: Do NOT include a roadmap_column field. All new ideas go to Backlog automatically.
 - For RICE, make your best estimate given the context. If unsure, use 3 for each.
-- discovery should default to "Validate" unless the user says otherwise.
-- For labels, include "Features" by default. Add "Productivity" if relevant."""
+- discovery should default to "Validate" unless the user says otherwise."""
 
 
 def create_jpd_idea(structured_data):
@@ -1100,26 +1102,27 @@ def create_jpd_idea(structured_data):
         SWIMLANE_FIELD: {"id": STRATEGIC_INITIATIVES_ID},
     }
 
-    # Roadmap column
-    roadmap = structured_data.get("roadmap_column")
-    if roadmap and roadmap.lower() in ROADMAP_COLUMN_LOOKUP:
-        fields[ROADMAP_FIELD] = {"id": ROADMAP_COLUMN_LOOKUP[roadmap.lower()]}
+    # Roadmap — always Backlog
+    fields[ROADMAP_FIELD] = {"id": ROADMAP_BACKLOG_ID}
 
-    # Initiative (multi-checkbox)
-    initiatives = structured_data.get("initiative", [])
-    if initiatives:
-        init_ids = []
-        for name in initiatives:
+    # Initiative — always 3 values: [module/feature], [MVP or Iteration], [Modules or Features]
+    init_ids = []
+    for key in ("initiative_module", "initiative_stage", "initiative_scope"):
+        name = structured_data.get(key, "")
+        if name:
             option_id = INITIATIVE_OPTIONS.get(name.lower())
             if option_id:
                 init_ids.append({"id": option_id})
-        if init_ids:
-            fields[INITIATIVE_FIELD] = init_ids
+    if init_ids:
+        fields[INITIATIVE_FIELD] = init_ids
 
-    # Labels
-    labels = structured_data.get("labels", ["Features"])
-    if labels:
-        fields[LABELS_FIELD] = labels
+    # Labels — only "Modules" or "Features"
+    label = structured_data.get("labels", "Features")
+    if isinstance(label, list):
+        label = label[0] if label else "Features"
+    if label not in ("Modules", "Features"):
+        label = "Features"
+    fields[LABELS_FIELD] = [label]
 
     # Product category
     prod_cat = structured_data.get("product_category")
@@ -1213,8 +1216,9 @@ def process_telegram_idea(user_text, chat_id, bot):
     issue_key = create_jpd_idea(structured)
     if issue_key:
         summary = structured.get("summary", "Untitled")
-        roadmap = structured.get("roadmap_column", "Not set")
-        initiatives = ", ".join(structured.get("initiative", []))
+        init_module = structured.get("initiative_module", "?")
+        init_stage = structured.get("initiative_stage", "?")
+        init_scope = structured.get("initiative_scope", "?")
         rice_r = structured.get("rice_reach", "?")
         rice_i = structured.get("rice_impact", "?")
         rice_c = structured.get("rice_confidence", "?")
@@ -1224,8 +1228,8 @@ def process_telegram_idea(user_text, chat_id, bot):
         msg = (
             f"✅ *{issue_key}* created!\n\n"
             f"📌 *{summary}*\n"
-            f"📅 Roadmap: {roadmap or 'Not set'}\n"
-            f"🏷 Initiative: {initiatives or 'Not set'}\n"
+            f"📅 Roadmap: Backlog\n"
+            f"🏷 Initiative: {init_module} · {init_stage} · {init_scope}\n"
             f"📊 RICE: R{rice_r} I{rice_i} C{rice_c} E{rice_e}\n\n"
             f"[Open on board]({link})"
         )
