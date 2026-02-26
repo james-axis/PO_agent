@@ -53,7 +53,48 @@ ROADMAP_COLUMNS = [
     {"value": "July (S2)",     "id": "10541"},
 ]
 ROADMAP_BACKLOG_ID = "10536"
+ROADMAP_SHIPPED_ID = "10234"
+ROADMAP_DONE_ID    = "10532"
 IDEAS_PER_COLUMN   = 3  # Max ideas per roadmap column (2-3 for first, 3 for rest)
+
+# ── Telegram Bot Config ───────────────────────────────────────────────────────
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+JAMES_ACCOUNT_ID   = "712020:b28bb054-a469-4a9f-bfde-0b93ad1101ae"
+
+# JPD Idea field option IDs
+STRATEGIC_INITIATIVES_ID = "10574"
+DISCOVERY_FIELD    = "customfield_10049"
+INITIATIVE_FIELD   = "customfield_10628"
+PRODUCT_CAT_FIELD  = "customfield_10391"
+LABELS_FIELD       = "labels"
+
+DISCOVERY_OPTIONS = {
+    "validate": "10027", "validating": "10026", "validated": "10025",
+    "won't do": "10028", "delivered": "10072",
+}
+
+INITIATIVE_OPTIONS = {
+    "crm facelift": "10272", "iextend feature": "10273", "payments module": "10310",
+    "insurance module": "10311", "extension feature": "10348", "compliance module": "10350",
+    "ai assistant feature": "10351", "notification feature": "10384", "quoting feature": "10385",
+    "onboarding module": "10386", "services module": "10387", "application module": "10388",
+    "dashboard module": "10389", "training module": "10390", "complaints module": "10391",
+    "claims module": "10392", "dishonours module": "10393", "task feature": "10394",
+    "website": "10397", "client portal module": "10396", "client profile module": "10430",
+    "system": "10463", "voa": "10576",
+    # Scope tags
+    "mvp": "10346", "iteration": "10347", "modules": "10533",
+    "workflows": "10534", "features": "10535",
+}
+
+PRODUCT_CATEGORY_OPTIONS = {
+    "analytics": "10190", "ai": "10191", "ux/ui": "10192",
+    "integrations": "10193", "expansion": "10194", "feedback": "10577",
+}
+
+# Roadmap column lookup (lowercase name → option ID)
+ROADMAP_COLUMN_LOOKUP = {col["value"].lower(): col["id"] for col in ROADMAP_COLUMNS}
+ROADMAP_COLUMN_LOOKUP.update({"shipped": ROADMAP_SHIPPED_ID, "done": ROADMAP_DONE_ID, "backlog": ROADMAP_BACKLOG_ID})
 
 auth    = (JIRA_EMAIL, JIRA_API_TOKEN)
 headers = {"Accept": "application/json", "Content-Type": "application/json"}
@@ -997,6 +1038,267 @@ def process_user_feedback():
     prioritise_feedback_ideas()
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# JOB 7: Telegram Bot — Create JPD Ideas from Voice/Text
+# ══════════════════════════════════════════════════════════════════════════════
+
+def build_idea_extraction_prompt(user_text):
+    """Build the Claude prompt to structure a Telegram message into a JPD idea."""
+    roadmap_cols = ", ".join(f'"{col["value"]}"' for col in ROADMAP_COLUMNS)
+    initiative_names = ", ".join(f'"{k.title()}"' for k in INITIATIVE_OPTIONS if k not in ("mvp", "iteration", "modules", "workflows", "features"))
+    scope_tags = '"MVP", "Iteration", "Modules", "Workflows", "Features"'
+    product_cats = ", ".join(f'"{k.title()}"' for k in PRODUCT_CATEGORY_OPTIONS)
+
+    return f"""You are a senior Product Manager for Axis CRM, a life insurance distribution CRM platform.
+The platform is used by AFSL-licensed insurance advisers to manage clients, policies, applications, quotes, payments and commissions.
+Partner insurers include TAL, Zurich, AIA, MLC Life, MetLife, Resolution Life, Integrity Life and others.
+
+A product idea has been submitted via Telegram (possibly from a voice note transcription — it may be informal/conversational).
+Your job is to extract and structure it into a fully-formed JPD idea.
+
+USER INPUT:
+{user_text}
+
+Respond with ONLY a JSON object (no markdown, no backticks, no explanation):
+
+{{
+  "summary": "Concise idea title (3-8 words)",
+  "description": "**Outcome we want to achieve**\\n\\n[Clear, specific outcome with measurable targets where possible.]\\n\\n**Why it's a problem**\\n\\n[Current pain point, inefficiency, or gap. Include evidence where available.]\\n\\n**How it gets us closer to our vision: The Adviser CRM that enables workflow and pipeline visibility, client engagement and compliance through intelligent automation.**\\n\\n[Connect to vision — workflow/pipeline visibility, client engagement, compliance, or intelligent automation.]\\n\\n**How it improves our north star: Total submissions**\\n\\n[Specific causal chain explaining how this increases total submissions.]",
+  "roadmap_column": "[One of: {roadmap_cols}, or null if not specified]",
+  "initiative": ["[Primary module/feature]", "[Scope tag if clear, e.g. MVP/Features/Modules]"],
+  "labels": ["Features"],
+  "product_category": "[One of: {product_cats}, or null]",
+  "discovery": "Validate",
+  "rice_reach": [1-5 estimate],
+  "rice_impact": [1-5 estimate],
+  "rice_confidence": [1-5 estimate],
+  "rice_effort": [1-5 estimate]
+}}
+
+RULES:
+- Write the description as a thoughtful PM would — substantive, not just parroting the input.
+- The four description sections are MANDATORY. Fill them all in based on the context.
+- For initiative, select from: {initiative_names}. Add a scope tag from {scope_tags} if it's clear.
+- For roadmap_column, ONLY set it if the user explicitly mentions a sprint/column (e.g. "March S2", "April sprint 1"). Use null if not mentioned.
+- For RICE, make your best estimate given the context. If unsure, use 3 for each.
+- discovery should default to "Validate" unless the user says otherwise.
+- For labels, include "Features" by default. Add "Productivity" if relevant."""
+
+
+def create_jpd_idea(structured_data):
+    """Create a JPD idea in Jira from structured data extracted by Claude."""
+    summary = structured_data.get("summary", "Untitled idea")
+    description_md = structured_data.get("description", "")
+
+    # Build the fields payload
+    fields = {
+        "project": {"key": AR_PROJECT_KEY},
+        "issuetype": {"name": "Idea"},
+        "summary": summary,
+        "description": {"version": 1, "type": "doc", "content": markdown_to_adf(description_md)},
+        "assignee": {"accountId": JAMES_ACCOUNT_ID},
+        "reporter": {"accountId": JAMES_ACCOUNT_ID},
+        SWIMLANE_FIELD: {"id": STRATEGIC_INITIATIVES_ID},
+    }
+
+    # Roadmap column
+    roadmap = structured_data.get("roadmap_column")
+    if roadmap and roadmap.lower() in ROADMAP_COLUMN_LOOKUP:
+        fields[ROADMAP_FIELD] = {"id": ROADMAP_COLUMN_LOOKUP[roadmap.lower()]}
+
+    # Initiative (multi-checkbox)
+    initiatives = structured_data.get("initiative", [])
+    if initiatives:
+        init_ids = []
+        for name in initiatives:
+            option_id = INITIATIVE_OPTIONS.get(name.lower())
+            if option_id:
+                init_ids.append({"id": option_id})
+        if init_ids:
+            fields[INITIATIVE_FIELD] = init_ids
+
+    # Labels
+    labels = structured_data.get("labels", ["Features"])
+    if labels:
+        fields[LABELS_FIELD] = labels
+
+    # Product category
+    prod_cat = structured_data.get("product_category")
+    if prod_cat and prod_cat.lower() in PRODUCT_CATEGORY_OPTIONS:
+        fields[PRODUCT_CAT_FIELD] = [{"id": PRODUCT_CATEGORY_OPTIONS[prod_cat.lower()]}]
+
+    # Discovery status
+    discovery = structured_data.get("discovery", "Validate")
+    if discovery and discovery.lower() in DISCOVERY_OPTIONS:
+        fields[DISCOVERY_FIELD] = {"id": DISCOVERY_OPTIONS[discovery.lower()]}
+
+    # RICE scores
+    for key, field_id in [("rice_reach", RICE_REACH_FIELD), ("rice_impact", RICE_IMPACT_FIELD),
+                          ("rice_confidence", RICE_CONFIDENCE_FIELD), ("rice_effort", RICE_EFFORT_FIELD)]:
+        val = structured_data.get(key)
+        if val is not None:
+            fields[field_id] = min(max(int(val), 1), 5)
+
+    ok, resp = jira_post("/rest/api/3/issue", {"fields": fields})
+    if ok:
+        issue_key = resp.json().get("key", "?")
+        log.info(f"  JOB 7: Created JPD idea {issue_key}: {summary}")
+        return issue_key
+    else:
+        log.error(f"  JOB 7: Failed to create idea: {resp.status_code} {resp.text[:300]}")
+        return None
+
+
+def transcribe_voice(file_path):
+    """Transcribe a voice note using SpeechRecognition + Google free API."""
+    try:
+        import speech_recognition as sr
+        from pydub import AudioSegment
+
+        # Convert OGG to WAV
+        wav_path = file_path.replace(".ogg", ".wav")
+        audio = AudioSegment.from_ogg(file_path)
+        audio.export(wav_path, format="wav")
+
+        recognizer = sr.Recognizer()
+        with sr.AudioFile(wav_path) as source:
+            audio_data = recognizer.record(source)
+
+        text = recognizer.recognize_google(audio_data)
+        log.info(f"  JOB 7: Transcribed voice: {text[:100]}...")
+        return text
+    except sr.UnknownValueError:
+        log.warning("  JOB 7: Could not understand the voice note.")
+        return None
+    except sr.RequestError as e:
+        log.error(f"  JOB 7: Speech recognition service error: {e}")
+        return None
+    except Exception as e:
+        log.error(f"  JOB 7: Transcription error: {e}")
+        return None
+    finally:
+        # Clean up temp files
+        for p in [file_path, file_path.replace(".ogg", ".wav")]:
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+
+
+def process_telegram_idea(user_text, chat_id, bot):
+    """Full pipeline: text → Claude structuring → Jira creation → Telegram reply."""
+    if not user_text or not user_text.strip():
+        bot.send_message(chat_id, "❌ Couldn't understand the message. Please try again.")
+        return
+
+    bot.send_message(chat_id, "🧠 Structuring your idea...")
+
+    # Call Claude to structure the idea
+    prompt = build_idea_extraction_prompt(user_text)
+    response = call_claude(prompt, max_tokens=2048)
+    if not response:
+        bot.send_message(chat_id, "❌ Failed to process with AI. Check the Anthropic API key.")
+        return
+
+    # Parse Claude's JSON response
+    try:
+        clean = re.sub(r'^```(?:json)?\s*', '', response)
+        clean = re.sub(r'\s*```$', '', clean)
+        structured = json.loads(clean)
+    except json.JSONDecodeError as e:
+        log.error(f"  JOB 7: JSON parse error: {e}\nRaw response: {response[:500]}")
+        bot.send_message(chat_id, "❌ Failed to parse AI response. Please try again.")
+        return
+
+    # Create the Jira idea
+    issue_key = create_jpd_idea(structured)
+    if issue_key:
+        summary = structured.get("summary", "Untitled")
+        roadmap = structured.get("roadmap_column", "Not set")
+        initiatives = ", ".join(structured.get("initiative", []))
+        rice_r = structured.get("rice_reach", "?")
+        rice_i = structured.get("rice_impact", "?")
+        rice_c = structured.get("rice_confidence", "?")
+        rice_e = structured.get("rice_effort", "?")
+
+        link = f"https://axiscrm.atlassian.net/jira/polaris/projects/AR/ideas/view/11184018?selectedIssue={issue_key}"
+        msg = (
+            f"✅ *{issue_key}* created!\n\n"
+            f"📌 *{summary}*\n"
+            f"📅 Roadmap: {roadmap or 'Not set'}\n"
+            f"🏷 Initiative: {initiatives or 'Not set'}\n"
+            f"📊 RICE: R{rice_r} I{rice_i} C{rice_c} E{rice_e}\n\n"
+            f"[Open on board]({link})"
+        )
+        bot.send_message(chat_id, msg, parse_mode="Markdown", disable_web_page_preview=True)
+    else:
+        bot.send_message(chat_id, "❌ Failed to create the idea in Jira. Check the logs.")
+
+
+def start_telegram_bot():
+    """Start the Telegram bot with polling in the current thread."""
+    if not TELEGRAM_BOT_TOKEN:
+        log.info("JOB 7: Telegram bot skipped — TELEGRAM_BOT_TOKEN not set.")
+        return
+
+    try:
+        import telebot
+    except ImportError:
+        log.error("JOB 7: pyTelegramBotAPI not installed. Add 'pyTelegramBotAPI' to requirements.txt.")
+        return
+
+    bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
+
+    @bot.message_handler(commands=["start", "help"])
+    def handle_start(message):
+        bot.reply_to(message,
+            "👋 *Alfred — Axis CRM Idea Bot*\n\n"
+            "Send me a text or voice note describing a product idea and I'll create it on the Strategic Roadmap board.\n\n"
+            "*Tips:*\n"
+            "• Mention the sprint column: _\"for March S2\"_\n"
+            "• Mention the module: _\"payments module\"_ or _\"compliance\"_\n"
+            "• Just describe the problem and I'll figure out the rest\n\n"
+            "*Example:*\n"
+            "_\"New idea for April S1 — adviser commission alerts in the payments module. "
+            "Advisers don't know when clawbacks are coming until it's too late...\"_",
+            parse_mode="Markdown"
+        )
+
+    @bot.message_handler(content_types=["voice"])
+    def handle_voice(message):
+        try:
+            bot.send_message(message.chat.id, "🎙 Transcribing your voice note...")
+            file_info = bot.get_file(message.voice.file_id)
+            downloaded = bot.download_file(file_info.file_path)
+            tmp_path = f"/tmp/voice_{message.message_id}.ogg"
+            with open(tmp_path, "wb") as f:
+                f.write(downloaded)
+
+            text = transcribe_voice(tmp_path)
+            if text:
+                bot.send_message(message.chat.id, f"📝 Heard: _{text}_", parse_mode="Markdown")
+                process_telegram_idea(text, message.chat.id, bot)
+            else:
+                bot.send_message(message.chat.id, "❌ Couldn't transcribe the voice note. Try sending it as text instead.")
+        except Exception as e:
+            log.error(f"JOB 7: Voice handling error: {e}")
+            bot.send_message(message.chat.id, f"❌ Error processing voice note: {e}")
+
+    @bot.message_handler(content_types=["text"])
+    def handle_text(message):
+        # Skip if it looks like a command we don't handle
+        if message.text.startswith("/"):
+            bot.reply_to(message, "Unknown command. Just send me a text or voice note with your idea!")
+            return
+        process_telegram_idea(message.text, message.chat.id, bot)
+
+    log.info("JOB 7: Telegram bot starting (polling)...")
+    try:
+        bot.infinity_polling(timeout=20, long_polling_timeout=20)
+    except Exception as e:
+        log.error(f"JOB 7: Telegram bot crashed: {e}", exc_info=True)
+
+
 # ── Main run ──────────────────────────────────────────────────────────────────
 
 def run():
@@ -1059,11 +1361,22 @@ def run():
 
 
 if __name__ == "__main__":
+    import threading
+
     sydney_tz = pytz.timezone("Australia/Sydney")
     scheduler = BlockingScheduler(timezone=sydney_tz)
     for hour, minute, name in [(7, 0, "7:00am"), (12, 0, "12:00pm"), (16, 0, "4:00pm")]:
         scheduler.add_job(run, trigger=CronTrigger(day_of_week="mon-fri", hour=hour, minute=minute, timezone=sydney_tz), id=name, name=f"{name} Sydney Run")
     log.info("Scheduler started — running at 7:00am, 12:00pm, 4:00pm AEDT Mon-Fri.")
     discover_reviewed_field()
+
+    # Start Telegram bot in a daemon thread (runs alongside scheduler)
+    if TELEGRAM_BOT_TOKEN:
+        tg_thread = threading.Thread(target=start_telegram_bot, daemon=True)
+        tg_thread.start()
+        log.info("JOB 7: Telegram bot thread started.")
+    else:
+        log.info("JOB 7: Skipped — TELEGRAM_BOT_TOKEN not set.")
+
     run()
     scheduler.start()

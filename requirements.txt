@@ -1,3 +1,6 @@
 requests
 apscheduler
 pytz
+pyTelegramBotAPI
+SpeechRecognition
+pydub
