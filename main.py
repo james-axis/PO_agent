@@ -1071,10 +1071,26 @@ def send_telegram(msg, parse_mode="Markdown"):
         log.error(f"Telegram send error: {e}")
     return False
 
-def build_idea_extraction_prompt(user_text):
+def build_idea_extraction_prompt(user_text, swimlane_id=None):
     """Build the Claude prompt to structure a Telegram message into a JPD idea."""
-    initiative_modules = ", ".join(f'"{k.title()}"' for k in INITIATIVE_OPTIONS if k not in ("mvp", "iteration", "modules", "workflows", "features"))
+    is_feedback = (swimlane_id == USER_FEEDBACK_OPTION_ID)
     product_cats = ", ".join(f'"{k.title()}"' for k in PRODUCT_CATEGORY_OPTIONS)
+
+    if is_feedback:
+        # Feedback ideas only need VoA initiative — no module/stage/scope
+        initiative_instructions = """- INITIATIVE: For User Feedback ideas, this is always just "VoA". Do NOT include initiative_module, initiative_stage, or initiative_scope."""
+        initiative_json = ""
+        labels_rule = '- LABELS: Must be either "Modules" or "Features" — pick the one that best fits the idea.'
+    else:
+        initiative_modules = ", ".join(f'"{k.title()}"' for k in INITIATIVE_OPTIONS if k not in ("mvp", "iteration", "modules", "workflows", "features"))
+        initiative_instructions = f"""- INITIATIVE must always have exactly 3 values:
+  1. initiative_module: The primary module or feature. Select ONE from: {initiative_modules}
+  2. initiative_stage: Either "MVP" (new capability) or "Iteration" (improving existing). Pick based on context.
+  3. initiative_scope: Either "Modules" (if it's a full module/screen) or "Features" (if it's a feature within a module)."""
+        initiative_json = """  "initiative_module": "[Primary module/feature — select ONE from the list below]",
+  "initiative_stage": "[MVP or Iteration]",
+  "initiative_scope": "[Modules or Features]","""
+        labels_rule = '- LABELS: Must be either "Modules" or "Features" — match whichever you picked for initiative_scope.'
 
     return f"""You are a senior Product Manager for Axis CRM, a life insurance distribution CRM platform.
 The platform is used by AFSL-licensed insurance advisers to manage clients, policies, applications, quotes, payments and commissions.
@@ -1091,10 +1107,8 @@ Respond with ONLY a JSON object (no markdown, no backticks, no explanation):
 {{
   "summary": "Concise idea title (3-8 words)",
   "description": "**Outcome we want to achieve**\\n\\n[Clear, specific outcome with measurable targets where possible.]\\n\\n**Why it's a problem**\\n\\n[Current pain point, inefficiency, or gap. Include evidence where available.]\\n\\n**How it gets us closer to our vision: The Adviser CRM that enables workflow and pipeline visibility, client engagement and compliance through intelligent automation.**\\n\\n[Connect to vision — workflow/pipeline visibility, client engagement, compliance, or intelligent automation.]\\n\\n**How it improves our north star: Total submissions**\\n\\n[Specific causal chain explaining how this increases total submissions.]",
-  "initiative_module": "[Primary module/feature — select ONE from the list below]",
-  "initiative_stage": "[MVP or Iteration]",
-  "initiative_scope": "[Modules or Features]",
-  "labels": "[Modules or Features — pick the one that matches initiative_scope]",
+  {initiative_json}
+  "labels": "[Modules or Features]",
   "product_category": "[One of: {product_cats}, or null]",
   "discovery": "Validate",
   "rice_reach": [1-5 estimate],
@@ -1106,11 +1120,8 @@ Respond with ONLY a JSON object (no markdown, no backticks, no explanation):
 RULES:
 - Write the description as a thoughtful PM would — substantive, not just parroting the input.
 - The four description sections are MANDATORY. Fill them all in based on the context.
-- INITIATIVE must always have exactly 3 values:
-  1. initiative_module: The primary module or feature. Select ONE from: {initiative_modules}
-  2. initiative_stage: Either "MVP" (new capability) or "Iteration" (improving existing). Pick based on context.
-  3. initiative_scope: Either "Modules" (if it's a full module/screen) or "Features" (if it's a feature within a module).
-- LABELS: Must be either "Modules" or "Features" — match whichever you picked for initiative_scope.
+{initiative_instructions}
+{labels_rule}
 - ROADMAP: Do NOT include a roadmap_column field. All new ideas go to Backlog automatically.
 - For RICE, make your best estimate given the context. If unsure, use 3 for each.
 - discovery should default to "Validate" unless the user says otherwise."""
@@ -1136,16 +1147,21 @@ def create_jpd_idea(structured_data, swimlane_id=None):
     # Roadmap — always Backlog
     fields[ROADMAP_FIELD] = {"id": ROADMAP_BACKLOG_ID}
 
-    # Initiative — always 3 values: [module/feature], [MVP or Iteration], [Modules or Features]
-    init_ids = []
-    for key in ("initiative_module", "initiative_stage", "initiative_scope"):
-        name = structured_data.get(key, "")
-        if name:
-            option_id = INITIATIVE_OPTIONS.get(name.lower())
-            if option_id:
-                init_ids.append({"id": option_id})
-    if init_ids:
-        fields[INITIATIVE_FIELD] = init_ids
+    # Initiative — Strategic: 3 values [module, stage, scope]; Feedback: just VoA
+    if swimlane_id == USER_FEEDBACK_OPTION_ID:
+        voa_id = INITIATIVE_OPTIONS.get("voa")
+        if voa_id:
+            fields[INITIATIVE_FIELD] = [{"id": voa_id}]
+    else:
+        init_ids = []
+        for key in ("initiative_module", "initiative_stage", "initiative_scope"):
+            name = structured_data.get(key, "")
+            if name:
+                option_id = INITIATIVE_OPTIONS.get(name.lower())
+                if option_id:
+                    init_ids.append({"id": option_id})
+        if init_ids:
+            fields[INITIATIVE_FIELD] = init_ids
 
     # Labels — only "Modules" or "Features"
     label = structured_data.get("labels", "Features")
@@ -1229,7 +1245,7 @@ def process_telegram_idea(user_text, chat_id, bot, swimlane_id=None):
     bot.send_message(chat_id, "🧠 Structuring your idea...")
 
     # Call Claude to structure the idea
-    prompt = build_idea_extraction_prompt(user_text)
+    prompt = build_idea_extraction_prompt(user_text, swimlane_id=swimlane_id)
     response = call_claude(prompt, max_tokens=2048)
     if not response:
         bot.send_message(chat_id, "❌ Failed to process with AI. Check the Anthropic API key.")
@@ -1249,9 +1265,6 @@ def process_telegram_idea(user_text, chat_id, bot, swimlane_id=None):
     issue_key = create_jpd_idea(structured, swimlane_id=swimlane_id)
     if issue_key:
         summary = structured.get("summary", "Untitled")
-        init_module = structured.get("initiative_module", "?")
-        init_stage = structured.get("initiative_stage", "?")
-        init_scope = structured.get("initiative_scope", "?")
         rice_r = structured.get("rice_reach", 3)
         rice_i = structured.get("rice_impact", 3)
         rice_c = structured.get("rice_confidence", 3)
@@ -1263,10 +1276,19 @@ def process_telegram_idea(user_text, chat_id, bot, swimlane_id=None):
 
         link = f"https://axiscrm.atlassian.net/jira/polaris/projects/AR/ideas/view/11184018?selectedIssue={issue_key}"
         lane_name = "User Feedback" if swimlane_id == USER_FEEDBACK_OPTION_ID else "Strategic Initiatives"
+
+        if swimlane_id == USER_FEEDBACK_OPTION_ID:
+            initiative_line = "🏷 VoA"
+        else:
+            init_module = structured.get("initiative_module", "?")
+            init_stage = structured.get("initiative_stage", "?")
+            init_scope = structured.get("initiative_scope", "?")
+            initiative_line = f"🏷 {init_module} · {init_stage} · {init_scope}"
+
         msg = (
             f"✅ *{issue_key}* — {summary}\n\n"
             f"🏊 {lane_name}\n"
-            f"🏷 {init_module} · {init_stage} · {init_scope}\n"
+            f"{initiative_line}\n"
             f"📊 Value: {rice_value:.1f} / 125\n\n"
             f"[Open on board]({link})"
         )
