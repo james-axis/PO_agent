@@ -1087,8 +1087,10 @@ RULES:
 - discovery should default to "Validate" unless the user says otherwise."""
 
 
-def create_jpd_idea(structured_data):
+def create_jpd_idea(structured_data, swimlane_id=None):
     """Create a JPD idea in Jira from structured data extracted by Claude."""
+    if swimlane_id is None:
+        swimlane_id = STRATEGIC_INITIATIVES_ID
     summary = structured_data.get("summary", "Untitled idea")
     description_md = structured_data.get("description", "")
 
@@ -1099,7 +1101,7 @@ def create_jpd_idea(structured_data):
         "summary": summary,
         "description": {"version": 1, "type": "doc", "content": markdown_to_adf(description_md)},
         "assignee": {"accountId": JAMES_ACCOUNT_ID},
-        SWIMLANE_FIELD: {"id": STRATEGIC_INITIATIVES_ID},
+        SWIMLANE_FIELD: {"id": swimlane_id},
     }
 
     # Roadmap — always Backlog
@@ -1187,8 +1189,10 @@ def transcribe_voice(file_path):
                 pass
 
 
-def process_telegram_idea(user_text, chat_id, bot):
+def process_telegram_idea(user_text, chat_id, bot, swimlane_id=None):
     """Full pipeline: text → Claude structuring → Jira creation → Telegram reply."""
+    if swimlane_id is None:
+        swimlane_id = STRATEGIC_INITIATIVES_ID
     if not user_text or not user_text.strip():
         bot.send_message(chat_id, "❌ Couldn't understand the message. Please try again.")
         return
@@ -1213,7 +1217,7 @@ def process_telegram_idea(user_text, chat_id, bot):
         return
 
     # Create the Jira idea
-    issue_key = create_jpd_idea(structured)
+    issue_key = create_jpd_idea(structured, swimlane_id=swimlane_id)
     if issue_key:
         summary = structured.get("summary", "Untitled")
         init_module = structured.get("initiative_module", "?")
@@ -1225,8 +1229,10 @@ def process_telegram_idea(user_text, chat_id, bot):
         rice_e = structured.get("rice_effort", "?")
 
         link = f"https://axiscrm.atlassian.net/jira/polaris/projects/AR/ideas/view/11184018?selectedIssue={issue_key}"
+        lane_name = "User Feedback" if swimlane_id == USER_FEEDBACK_OPTION_ID else "Strategic Initiatives"
         msg = (
             f"✅ *{issue_key}* — {summary}\n\n"
+            f"🏊 {lane_name}\n"
             f"🏷 {init_module} · {init_stage} · {init_scope}\n"
             f"📊 RICE: R{rice_r} I{rice_i} C{rice_c} E{rice_e}\n\n"
             f"[Open on board]({link})"
@@ -1249,7 +1255,7 @@ def start_telegram_bot():
         return
 
     bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
-    # Track which mode each user is in (default: idea)
+    # Track which mode each user is in: {"mode": "roadmap"|"backlog", "swimlane": "strategic"|"feedback"}
     user_mode = {}
 
     @bot.message_handler(commands=["start", "help"])
@@ -1257,24 +1263,35 @@ def start_telegram_bot():
         bot.reply_to(message,
             "👋 *Alfred — Axis CRM Bot*\n\n"
             "Two modes:\n\n"
-            "*🧠 /idea* — Create a JPD idea on the Strategic Roadmap\n"
-            "Send a text or voice note and I'll create a fully-formed idea in Backlog.\n\n"
-            "*🔨 /work* — Create an Epic + child tickets in Sprints\n"
+            "*🧠 /roadmap* — Create a JPD idea on the Strategic Roadmap\n"
+            "Default swimlane: Strategic Initiatives\n"
+            "Switch swimlane: `/roadmap feedback` or `/roadmap strategic`\n\n"
+            "*🔨 /backlog* — Create an Epic + child tickets in Sprints\n"
             "Describe what needs building and I'll create an Epic with broken-down tasks, all linked and ≤3pts each.\n\n"
-            "*Current mode:* /idea (default)\n"
-            "Switch anytime with /idea or /work, then send your message.",
+            "*Current mode:* /roadmap (default)\n"
+            "Switch anytime, then send your message.",
             parse_mode="Markdown"
         )
 
-    @bot.message_handler(commands=["idea"])
-    def handle_idea_mode(message):
-        user_mode[message.chat.id] = "idea"
-        bot.reply_to(message, "🧠 *Idea mode* — send a text or voice note and I'll create a JPD idea on the Strategic Roadmap.", parse_mode="Markdown")
+    @bot.message_handler(commands=["roadmap"])
+    def handle_roadmap_mode(message):
+        # Parse optional swimlane argument
+        parts = message.text.strip().split(maxsplit=1)
+        swimlane = "strategic"  # default
+        if len(parts) > 1:
+            arg = parts[1].strip().lower()
+            if arg in ("feedback", "user feedback", "uf"):
+                swimlane = "feedback"
+            elif arg in ("strategic", "strategic initiatives", "si"):
+                swimlane = "strategic"
+        user_mode[message.chat.id] = {"mode": "roadmap", "swimlane": swimlane}
+        lane_name = "User Feedback" if swimlane == "feedback" else "Strategic Initiatives"
+        bot.reply_to(message, f"🧠 *Roadmap mode* — swimlane: *{lane_name}*\nSend a text or voice note to create an idea.", parse_mode="Markdown")
 
-    @bot.message_handler(commands=["work"])
-    def handle_work_mode(message):
-        user_mode[message.chat.id] = "work"
-        bot.reply_to(message, "🔨 *Work mode* — send a text or voice note and I'll create an Epic with broken-down tickets in Sprints.", parse_mode="Markdown")
+    @bot.message_handler(commands=["backlog"])
+    def handle_backlog_mode(message):
+        user_mode[message.chat.id] = {"mode": "backlog", "swimlane": "strategic"}
+        bot.reply_to(message, "🔨 *Backlog mode* — send a text or voice note and I'll create an Epic with broken-down tickets in Sprints.", parse_mode="Markdown")
 
     @bot.message_handler(content_types=["voice"])
     def handle_voice(message):
@@ -1289,11 +1306,12 @@ def start_telegram_bot():
             text = transcribe_voice(tmp_path)
             if text:
                 bot.send_message(message.chat.id, f"📝 Heard: _{text}_", parse_mode="Markdown")
-                mode = user_mode.get(message.chat.id, "idea")
-                if mode == "work":
+                state = user_mode.get(message.chat.id, {"mode": "roadmap", "swimlane": "strategic"})
+                if state["mode"] == "backlog":
                     process_telegram_work(text, message.chat.id, bot)
                 else:
-                    process_telegram_idea(text, message.chat.id, bot)
+                    swimlane_id = USER_FEEDBACK_OPTION_ID if state["swimlane"] == "feedback" else STRATEGIC_INITIATIVES_ID
+                    process_telegram_idea(text, message.chat.id, bot, swimlane_id=swimlane_id)
             else:
                 bot.send_message(message.chat.id, "❌ Couldn't transcribe the voice note. Try sending it as text instead.")
         except Exception as e:
@@ -1303,13 +1321,14 @@ def start_telegram_bot():
     @bot.message_handler(content_types=["text"])
     def handle_text(message):
         if message.text.startswith("/"):
-            bot.reply_to(message, "Unknown command. Try /idea, /work, or /help")
+            bot.reply_to(message, "Unknown command. Try /roadmap, /backlog, or /help")
             return
-        mode = user_mode.get(message.chat.id, "idea")
-        if mode == "work":
+        state = user_mode.get(message.chat.id, {"mode": "roadmap", "swimlane": "strategic"})
+        if state["mode"] == "backlog":
             process_telegram_work(message.text, message.chat.id, bot)
         else:
-            process_telegram_idea(message.text, message.chat.id, bot)
+            swimlane_id = USER_FEEDBACK_OPTION_ID if state["swimlane"] == "feedback" else STRATEGIC_INITIATIVES_ID
+            process_telegram_idea(message.text, message.chat.id, bot, swimlane_id=swimlane_id)
 
     log.info("JOB 7: Telegram bot starting (polling)...")
     try:
