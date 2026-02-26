@@ -1978,6 +1978,295 @@ def archive_old_backlog():
 
     log.info(f"JOB 12: Archived {archived} tickets.")
 
+# ══════════════════════════════════════════════════════════════════════════════
+# JOB 13: Micro-Decomposition — Break tickets into 0.5-1 SP sub-tasks
+# ══════════════════════════════════════════════════════════════════════════════
+
+MICRO_LABEL = "micro-decomposed"
+DECOMPOSE_TYPES = {"Task", "Bug", "Maintenance"}
+DECOMPOSE_STATUSES = {"Ready", "Prep", "Refine"}
+DECOMPOSE_MIN_SP = 2  # Only decompose tickets with SP >= this
+
+
+def get_decomposable_issues():
+    """Find tickets eligible for micro-decomposition: SP >= 2, no micro-decomposed label,
+    in Ready/Prep/Refine status, Task/Bug/Maintenance types."""
+    issues, start_at = [], 0
+    while True:
+        data = jira_get("/rest/api/3/search/jql", params={
+            "jql": (
+                f'project = AX AND issuetype in (Task, Bug, Maintenance) '
+                f'AND "Story point estimate" >= {DECOMPOSE_MIN_SP} '
+                f'AND status in (Ready, Prep, Refine) '
+                f'AND labels not in ("{MICRO_LABEL}") '
+                f'AND summary !~ "[SPLIT]" '
+                f'ORDER BY rank ASC'
+            ),
+            "fields": "summary,description,issuetype,priority,status,parent,assignee,"
+                       f"{STORY_POINTS_FIELD},labels,issuelinks,sprint",
+            "maxResults": 50,
+            "startAt": start_at,
+        })
+        batch = data.get("issues", [])
+        issues.extend(batch)
+        if start_at + len(batch) >= data.get("total", 0):
+            break
+        start_at += len(batch)
+    return issues
+
+
+def build_decomposition_prompt(issue, linked_content, confluence_context):
+    """Build Claude prompt for micro-decomposing a ticket into 0.5-1 SP sub-tasks."""
+    f = issue["fields"]
+    summary = f["summary"]
+    desc = f.get("description") or ""
+    if isinstance(desc, dict):
+        desc = adf_to_text(desc)
+    priority = (f.get("priority") or {}).get("name", "Medium")
+    parent_summary = (f.get("parent") or {}).get("fields", {}).get("summary", "")
+    sp = f.get(STORY_POINTS_FIELD) or 0
+    issue_type = f["issuetype"]["name"]
+
+    clean_desc = re.sub(r'\[?\*?\*?Definition of (Ready|Done).*$', '', desc, flags=re.DOTALL).strip()
+    clean_desc = re.sub(r'!\[.*?\]\(blob:.*?\)', '[image attached]', clean_desc)
+
+    ctx = ""
+    if linked_content:
+        ctx += f"\nLINKED CONTENT:\n{linked_content}\n"
+    if confluence_context:
+        ctx += f"\nRELATED CONFLUENCE PAGES:\n{confluence_context}\n"
+
+    return f"""You are a senior Software Engineering Lead at Axis CRM, a life insurance distribution CRM platform.
+The platform is built with Django/Python, used by AFSL-licensed insurance advisers to manage clients, policies, applications, quotes, payments and commissions.
+Partner insurers include TAL, Zurich, AIA, MLC Life, MetLife, Resolution Life, Integrity Life and others.
+
+You are breaking down a Jira {issue_type} ticket into the SMALLEST possible sub-tasks for smooth sprint burndown.
+The goal is: each sub-task = one atomic commit/PR that can be reviewed and merged independently.
+
+TICKET: {issue["key"]}
+SUMMARY: {summary}
+PARENT EPIC: {parent_summary or 'None'}
+PRIORITY: {priority}
+CURRENT STORY POINTS: {sp}
+TYPE: {issue_type}
+DESCRIPTION:
+{clean_desc}
+{ctx}
+
+RULES:
+- Break this into sub-tasks of 0.5 or 1 story points each. 0.5 = ~1 hour, 1 = ~2 hours.
+- Each sub-task MUST be independently shippable — a single commit/PR that doesn't break the codebase.
+- Order sub-tasks in logical implementation sequence (e.g., model changes → backend logic → API/views → templates/UI → tests).
+- Think about what an engineer would actually commit separately: migrations, model fields, view logic, template changes, admin changes, tests.
+- For a Django CRM: consider separating model/migration, view/URL, template/CSS, admin, permission, test, and documentation changes.
+- Sub-task summaries should be specific and actionable (e.g., "Add can_view_calls field to UserRole model + migration" not "Update model").
+- Each sub-task needs 1-3 clear acceptance criteria.
+- The sum of all sub-task story points should equal or be close to the original {sp} SP.
+- Minimum 2 sub-tasks, no maximum but be practical.
+- Do NOT include test-only sub-tasks unless the testing is substantial (>1hr). Instead, include relevant tests within each sub-task.
+
+RESPOND IN EXACTLY THIS JSON FORMAT (no markdown fences):
+{{
+  "sub_tasks": [
+    {{
+      "summary": "<specific actionable sub-task title>",
+      "story_points": <0.5 or 1>,
+      "acceptance_criteria": ["<criterion 1>", "<criterion 2>"],
+      "sequence": <1, 2, 3...>
+    }}
+  ],
+  "decomposition_rationale": "<1 sentence explaining why this breakdown makes sense>"
+}}"""
+
+
+def create_subtask(parent_issue, subtask_data, sequence_num):
+    """Create a Jira subtask under the parent issue."""
+    f = parent_issue["fields"]
+    ac = subtask_data.get("acceptance_criteria", [])
+    ac_str = "\n".join(f"- [ ] {c}" for c in ac) if ac else "- [ ] TBD"
+
+    desc_md = f"""**Summary:** Sub-task {sequence_num} of {parent_issue['key']}
+
+**Acceptance criteria:**
+{ac_str}
+
+**Engineer:**
+1. **Technical plan:**
+2. **Story points estimated:** {subtask_data.get('story_points', 0.5)}
+
+{DOR_DOD_TASK}"""
+
+    payload = {
+        "fields": {
+            "project": {"key": "AX"},
+            "parent": {"key": parent_issue["key"]},
+            "summary": subtask_data["summary"],
+            "issuetype": {"name": "Subtask"},
+            STORY_POINTS_FIELD: float(subtask_data.get("story_points", 0.5)),
+            "description": {"version": 1, "type": "doc", "content": markdown_to_adf(desc_md)},
+        }
+    }
+
+    if f.get("assignee"):
+        payload["fields"]["assignee"] = {"accountId": f["assignee"]["accountId"]}
+    if f.get("priority"):
+        payload["fields"]["priority"] = {"name": f["priority"]["name"]}
+
+    ok, r = jira_post("/rest/api/3/issue", payload)
+    if ok:
+        new_key = r.json().get("key", "?")
+        log.info(f"    Created subtask {new_key}: {subtask_data['summary']} ({subtask_data.get('story_points', 0.5)}SP)")
+
+        # Move subtask to parent's sprint if applicable
+        sprint_data = f.get("sprint")
+        if sprint_data and sprint_data.get("id"):
+            move_issue_to_sprint(new_key, sprint_data["id"])
+
+        return new_key
+    else:
+        log.error(f"    Failed to create subtask: {r.status_code} {r.text[:300]}")
+        return None
+
+
+def add_label_to_issue(issue_key, label):
+    """Add a label to an issue without removing existing labels."""
+    ok, r = jira_put(f"/rest/api/3/issue/{issue_key}", {
+        "update": {"labels": [{"add": label}]}
+    })
+    if not ok:
+        log.warning(f"  Failed to add label '{label}' to {issue_key}: {r.status_code if r else 'no response'}")
+    return ok
+
+
+def add_comment_to_issue(issue_key, comment_md):
+    """Add a comment to an issue using ADF."""
+    payload = {
+        "body": {"version": 1, "type": "doc", "content": markdown_to_adf(comment_md)}
+    }
+    ok, r = jira_post(f"/rest/api/3/issue/{issue_key}/comment", payload)
+    if not ok:
+        log.warning(f"  Failed to add comment to {issue_key}: {r.status_code if r else 'no response'}")
+    return ok
+
+
+def micro_decompose_tickets():
+    """JOB 13: Break tickets >= 2 SP into 0.5-1 SP subtasks for smooth burndown."""
+    if not ANTHROPIC_API_KEY:
+        log.info("JOB 13 skipped — ANTHROPIC_API_KEY not set.")
+        return
+
+    issues = get_decomposable_issues()
+    if not issues:
+        log.info("JOB 13: No tickets eligible for micro-decomposition.")
+        return
+
+    log.info(f"JOB 13: Found {len(issues)} ticket(s) to micro-decompose.")
+
+    # Limit per run to avoid API overload (process up to 10 per cycle)
+    max_per_run = 10
+    processed = 0
+
+    for issue in issues[:max_per_run]:
+        key = issue["key"]
+        f = issue["fields"]
+        summary = f["summary"]
+        sp = f.get(STORY_POINTS_FIELD) or 0
+
+        log.info(f"  Decomposing {key} ({sp}SP): {summary}")
+
+        # Check if already has subtasks — skip if so
+        subtask_links = [
+            link for link in (f.get("subtasks") or [])
+        ]
+        # Also check via issuelinks for child issues
+        existing_children = jira_get("/rest/api/3/search/jql", params={
+            "jql": f'parent = {key} AND issuetype = Subtask',
+            "fields": "summary",
+            "maxResults": 1,
+        })
+        if existing_children.get("total", 0) > 0:
+            log.info(f"  Skipping {key} — already has subtasks.")
+            add_label_to_issue(key, MICRO_LABEL)
+            continue
+
+        # Gather context
+        linked_content = fetch_linked_content(issue)
+        confluence_context = search_confluence_for_context(summary)
+
+        # Build prompt and call Claude
+        prompt = build_decomposition_prompt(issue, linked_content, confluence_context)
+        response = call_claude(prompt, max_tokens=3000)
+
+        if not response:
+            log.warning(f"  Skipping {key} — Claude decomposition failed.")
+            continue
+
+        # Parse response
+        try:
+            clean = re.sub(r'^```(?:json)?\s*', '', response)
+            clean = re.sub(r'\s*```$', '', clean)
+            decomposition = json.loads(clean)
+        except json.JSONDecodeError as e:
+            log.warning(f"  Skipping {key} — JSON parse error: {e}")
+            log.debug(f"  Response: {response[:500]}")
+            continue
+
+        sub_tasks = decomposition.get("sub_tasks", [])
+        rationale = decomposition.get("decomposition_rationale", "")
+
+        if len(sub_tasks) < 2:
+            log.info(f"  Skipping {key} — decomposition returned fewer than 2 sub-tasks.")
+            continue
+
+        # Sort by sequence
+        sub_tasks.sort(key=lambda x: x.get("sequence", 0))
+
+        # Create subtasks
+        created_keys = []
+        total_sp = 0
+        for i, st in enumerate(sub_tasks, 1):
+            new_key = create_subtask(issue, st, i)
+            if new_key:
+                created_keys.append(new_key)
+                total_sp += float(st.get("story_points", 0.5))
+
+        if not created_keys:
+            log.warning(f"  Skipping {key} — no subtasks were created successfully.")
+            continue
+
+        # Update parent: add label, update SP to match sum, add comment
+        add_label_to_issue(key, MICRO_LABEL)
+
+        # Update parent SP to match sum of subtasks
+        update_issue_fields(key, story_points=total_sp, reviewed_value=None)
+
+        # Add explanatory comment
+        subtask_list = "\n".join(
+            f"- {k}: {st['summary']} ({st.get('story_points', 0.5)}SP)"
+            for k, st in zip(created_keys, sub_tasks) if k
+        )
+        comment = (
+            f"**Micro-Decomposition (JOB 13)**\n\n"
+            f"This ticket has been broken into {len(created_keys)} sub-tasks "
+            f"for smoother sprint burndown:\n\n{subtask_list}\n\n"
+            f"**Total:** {total_sp}SP across {len(created_keys)} sub-tasks "
+            f"(original: {sp}SP)\n\n"
+            f"**Rationale:** {rationale}"
+        )
+        add_comment_to_issue(key, comment)
+
+        processed += 1
+        log.info(f"  Completed {key} → {len(created_keys)} subtasks ({total_sp}SP total).")
+
+    log.info(f"JOB 13: Micro-decomposed {processed} ticket(s).")
+
+    if processed > 0:
+        send_telegram(
+            f"🔬 *Micro-Decomposition*: Broke {processed} ticket(s) into sub-tasks "
+            f"(0.5-1 SP each) for smoother burndown."
+        )
+
+
 def run():
     log.info("=== Starting Jira prioritisation run ===")
     try:
@@ -2037,6 +2326,9 @@ def run():
 
         log.info("JOB 12: Archive Old Backlog")
         archive_old_backlog()
+
+        log.info("JOB 13: Micro-Decomposition")
+        micro_decompose_tickets()
 
         log.info("=== Run complete ===")
     except Exception as e:
