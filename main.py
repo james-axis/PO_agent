@@ -59,7 +59,17 @@ IDEAS_PER_COLUMN   = 3  # Max ideas per roadmap column (2-3 for first, 3 for res
 
 # ── Telegram Bot Config ───────────────────────────────────────────────────────
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")  # Auto-captured from first message if not set
 JAMES_ACCOUNT_ID   = "712020:b28bb054-a469-4a9f-bfde-0b93ad1101ae"
+
+# ── Archive Config ────────────────────────────────────────────────────────────
+ARCHIVE_PROJECT_KEY = "ARU"
+ARCHIVE_AGE_DAYS    = 90
+# ARU only has Task, Bug, Story, Epic, Subtask — map others to Task
+ARCHIVE_TYPE_MAP = {
+    "Task": "Task", "Bug": "Bug", "Epic": "Epic", "Subtask": "Subtask",
+    "Spike": "Task", "Support": "Task", "Maintenance": "Task", "Story": "Story",
+}
 
 # JPD Idea field option IDs
 STRATEGIC_INITIATIVES_ID = "10574"
@@ -1042,6 +1052,25 @@ def process_user_feedback():
 # JOB 7: Telegram Bot — Create JPD Ideas from Voice/Text
 # ══════════════════════════════════════════════════════════════════════════════
 
+def send_telegram(msg, parse_mode="Markdown"):
+    """Send a proactive Telegram message (for briefings/alerts)."""
+    chat_id = TELEGRAM_CHAT_ID
+    if not chat_id or not TELEGRAM_BOT_TOKEN:
+        log.warning("Cannot send Telegram message — TELEGRAM_CHAT_ID or TELEGRAM_BOT_TOKEN not set.")
+        return False
+    try:
+        r = requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            json={"chat_id": chat_id, "text": msg, "parse_mode": parse_mode, "disable_web_page_preview": True},
+            timeout=10,
+        )
+        if r.status_code == 200:
+            return True
+        log.warning(f"Telegram send failed: {r.status_code} {r.text[:200]}")
+    except Exception as e:
+        log.error(f"Telegram send error: {e}")
+    return False
+
 def build_idea_extraction_prompt(user_text):
     """Build the Claude prompt to structure a Telegram message into a JPD idea."""
     initiative_modules = ", ".join(f'"{k.title()}"' for k in INITIATIVE_OPTIONS if k not in ("mvp", "iteration", "modules", "workflows", "features"))
@@ -1259,46 +1288,49 @@ def start_telegram_bot():
         return
 
     bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
-    # Track which mode each user is in: {"mode": "roadmap"|"backlog", "swimlane": "strategic"|"feedback"}
     user_mode = {}
+
+    def save_chat_id(chat_id):
+        """Auto-capture chat ID for proactive messaging."""
+        global TELEGRAM_CHAT_ID
+        if not TELEGRAM_CHAT_ID:
+            TELEGRAM_CHAT_ID = str(chat_id)
+            log.info(f"Telegram chat ID captured: {TELEGRAM_CHAT_ID}")
 
     @bot.message_handler(commands=["start", "help"])
     def handle_start(message):
+        save_chat_id(message.chat.id)
         bot.reply_to(message,
             "👋 *Alfred — Axis CRM Bot*\n\n"
-            "Two modes:\n\n"
-            "*🧠 /roadmap* — Create a JPD idea on the Strategic Roadmap\n"
-            "Default swimlane: Strategic Initiatives\n"
-            "Switch swimlane: `/roadmap feedback` or `/roadmap strategic`\n\n"
-            "*🔨 /backlog* — Create an Epic + child tickets in Sprints\n"
-            "Describe what needs building and I'll create an Epic with broken-down tasks, all linked and ≤3pts each.\n\n"
-            "*Current mode:* /roadmap (default)\n"
-            "Switch anytime, then send your message.",
+            "*🧠 /strategic* — Create idea → Strategic Initiatives swimlane\n"
+            "*💬 /feedback* — Create idea → User Feedback swimlane\n"
+            "*🔨 /backlog* — Create Epic + broken-down tickets in Sprints\n\n"
+            "Send a text or voice note after selecting a mode.\n"
+            "Default mode: /strategic",
             parse_mode="Markdown"
         )
 
-    @bot.message_handler(commands=["roadmap"])
-    def handle_roadmap_mode(message):
-        # Parse optional swimlane argument
-        parts = message.text.strip().split(maxsplit=1)
-        swimlane = "strategic"  # default
-        if len(parts) > 1:
-            arg = parts[1].strip().lower()
-            if arg in ("feedback", "user feedback", "uf"):
-                swimlane = "feedback"
-            elif arg in ("strategic", "strategic initiatives", "si"):
-                swimlane = "strategic"
-        user_mode[message.chat.id] = {"mode": "roadmap", "swimlane": swimlane}
-        lane_name = "User Feedback" if swimlane == "feedback" else "Strategic Initiatives"
-        bot.reply_to(message, f"🧠 *Roadmap mode* — swimlane: *{lane_name}*\nSend a text or voice note to create an idea.", parse_mode="Markdown")
+    @bot.message_handler(commands=["strategic"])
+    def handle_strategic(message):
+        save_chat_id(message.chat.id)
+        user_mode[message.chat.id] = {"mode": "roadmap", "swimlane": STRATEGIC_INITIATIVES_ID}
+        bot.reply_to(message, "🧠 *Strategic Initiatives* — send your idea.", parse_mode="Markdown")
+
+    @bot.message_handler(commands=["feedback"])
+    def handle_feedback(message):
+        save_chat_id(message.chat.id)
+        user_mode[message.chat.id] = {"mode": "roadmap", "swimlane": USER_FEEDBACK_OPTION_ID}
+        bot.reply_to(message, "💬 *User Feedback* — send your idea.", parse_mode="Markdown")
 
     @bot.message_handler(commands=["backlog"])
     def handle_backlog_mode(message):
-        user_mode[message.chat.id] = {"mode": "backlog", "swimlane": "strategic"}
-        bot.reply_to(message, "🔨 *Backlog mode* — send a text or voice note and I'll create an Epic with broken-down tickets in Sprints.", parse_mode="Markdown")
+        save_chat_id(message.chat.id)
+        user_mode[message.chat.id] = {"mode": "backlog", "swimlane": STRATEGIC_INITIATIVES_ID}
+        bot.reply_to(message, "🔨 *Backlog mode* — describe what needs building.", parse_mode="Markdown")
 
     @bot.message_handler(content_types=["voice"])
     def handle_voice(message):
+        save_chat_id(message.chat.id)
         try:
             bot.send_message(message.chat.id, "🎙 Transcribing your voice note...")
             file_info = bot.get_file(message.voice.file_id)
@@ -1310,12 +1342,11 @@ def start_telegram_bot():
             text = transcribe_voice(tmp_path)
             if text:
                 bot.send_message(message.chat.id, f"📝 Heard: _{text}_", parse_mode="Markdown")
-                state = user_mode.get(message.chat.id, {"mode": "roadmap", "swimlane": "strategic"})
+                state = user_mode.get(message.chat.id, {"mode": "roadmap", "swimlane": STRATEGIC_INITIATIVES_ID})
                 if state["mode"] == "backlog":
                     process_telegram_work(text, message.chat.id, bot)
                 else:
-                    swimlane_id = USER_FEEDBACK_OPTION_ID if state["swimlane"] == "feedback" else STRATEGIC_INITIATIVES_ID
-                    process_telegram_idea(text, message.chat.id, bot, swimlane_id=swimlane_id)
+                    process_telegram_idea(text, message.chat.id, bot, swimlane_id=state["swimlane"])
             else:
                 bot.send_message(message.chat.id, "❌ Couldn't transcribe the voice note. Try sending it as text instead.")
         except Exception as e:
@@ -1324,15 +1355,15 @@ def start_telegram_bot():
 
     @bot.message_handler(content_types=["text"])
     def handle_text(message):
+        save_chat_id(message.chat.id)
         if message.text.startswith("/"):
-            bot.reply_to(message, "Unknown command. Try /roadmap, /backlog, or /help")
+            bot.reply_to(message, "Unknown command. Try /strategic, /feedback, /backlog, or /help")
             return
-        state = user_mode.get(message.chat.id, {"mode": "roadmap", "swimlane": "strategic"})
+        state = user_mode.get(message.chat.id, {"mode": "roadmap", "swimlane": STRATEGIC_INITIATIVES_ID})
         if state["mode"] == "backlog":
             process_telegram_work(message.text, message.chat.id, bot)
         else:
-            swimlane_id = USER_FEEDBACK_OPTION_ID if state["swimlane"] == "feedback" else STRATEGIC_INITIATIVES_ID
-            process_telegram_idea(message.text, message.chat.id, bot, swimlane_id=swimlane_id)
+            process_telegram_idea(message.text, message.chat.id, bot, swimlane_id=state["swimlane"])
 
     log.info("JOB 7: Telegram bot starting (polling)...")
     try:
@@ -1592,7 +1623,338 @@ def process_telegram_work(user_text, chat_id, bot):
     bot.send_message(chat_id, msg, parse_mode="Markdown", disable_web_page_preview=True)
 
 
-# ── Main run ──────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# JOB 9: Morning Briefing (Telegram)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def get_sprint_stats():
+    """Gather current sprint stats for briefings."""
+    stats = {"active_sprint": None, "total_pts": 0, "done_pts": 0, "in_progress": [], "stuck": [], "ready_count": 0}
+    active = get_active_sprint()
+    if not active:
+        return stats
+    sprint = active[0]
+    stats["active_sprint"] = sprint["name"]
+    sid = sprint["id"]
+
+    issues = get_sprint_issues(sid)
+    for issue in issues:
+        f = issue["fields"]
+        pts = f.get(STORY_POINTS_FIELD) or 0
+        status = (f.get("status") or {}).get("name", "").lower()
+        stats["total_pts"] += pts
+
+        if status in COMPLETED_STATUSES:
+            stats["done_pts"] += pts
+        elif status == "in progress":
+            # Check if stuck (updated > 3 days ago)
+            updated = f.get("updated", "")
+            if updated:
+                try:
+                    updated_dt = datetime.fromisoformat(updated.replace("Z", "+00:00"))
+                    age_days = (datetime.now(pytz.utc) - updated_dt).days
+                    entry = {"key": issue["key"], "summary": f.get("summary", "")[:50], "days": age_days, "pts": pts}
+                    stats["in_progress"].append(entry)
+                    if age_days >= 3:
+                        stats["stuck"].append(entry)
+                except Exception:
+                    stats["in_progress"].append({"key": issue["key"], "summary": f.get("summary", "")[:50], "days": 0, "pts": pts})
+        elif status == "ready":
+            stats["ready_count"] += 1
+    return stats
+
+
+def send_morning_briefing():
+    """JOB 9: Send morning briefing to Telegram."""
+    log.info("JOB 9: Morning Briefing")
+    if not TELEGRAM_CHAT_ID:
+        log.info("JOB 9: Skipped — no TELEGRAM_CHAT_ID.")
+        return
+
+    stats = get_sprint_stats()
+    if not stats["active_sprint"]:
+        send_telegram("☀️ *Morning Briefing*\n\nNo active sprint found.")
+        return
+
+    health = int((stats["done_pts"] / stats["total_pts"] * 100)) if stats["total_pts"] > 0 else 0
+    remaining = stats["total_pts"] - stats["done_pts"]
+
+    msg = f"☀️ *Morning Briefing*\n\n"
+    msg += f"🏃 *Sprint:* {stats['active_sprint']}\n"
+    msg += f"📊 *Health:* {health}% complete ({stats['done_pts']:.0f}/{stats['total_pts']:.0f} pts)\n"
+    msg += f"📋 *Remaining:* {remaining:.0f} pts\n"
+    msg += f"🔄 *In Progress:* {len(stats['in_progress'])} tickets\n"
+    msg += f"📥 *Ready:* {stats['ready_count']} tickets waiting\n"
+
+    if stats["stuck"]:
+        msg += f"\n⚠️ *Stuck ({len(stats['stuck'])}):*\n"
+        for t in stats["stuck"]:
+            msg += f"  • {t['key']} — {t['summary']} ({t['days']}d)\n"
+
+    # Backlog count
+    try:
+        backlog = get_backlog_issues()
+        msg += f"\n📦 *Backlog:* {len(backlog)} tickets"
+    except Exception:
+        pass
+
+    send_telegram(msg)
+    log.info("JOB 9: Morning briefing sent.")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# JOB 10: EOD Summary (Telegram)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def send_eod_summary():
+    """JOB 10: Send end-of-day summary to Telegram."""
+    log.info("JOB 10: EOD Summary")
+    if not TELEGRAM_CHAT_ID:
+        log.info("JOB 10: Skipped — no TELEGRAM_CHAT_ID.")
+        return
+
+    stats = get_sprint_stats()
+    if not stats["active_sprint"]:
+        send_telegram("🌙 *EOD Summary*\n\nNo active sprint.")
+        return
+
+    health = int((stats["done_pts"] / stats["total_pts"] * 100)) if stats["total_pts"] > 0 else 0
+
+    # Find tickets updated today
+    today_start = datetime.now(pytz.timezone("Australia/Sydney")).replace(hour=0, minute=0, second=0).strftime("%Y-%m-%d")
+    try:
+        data = jira_get("/rest/api/3/search/jql", params={
+            "jql": f'project = AX AND updated >= "{today_start}" ORDER BY updated DESC',
+            "fields": "summary,status,assignee",
+            "maxResults": 20,
+        })
+        moved_today = data.get("issues", [])
+    except Exception:
+        moved_today = []
+
+    msg = f"🌙 *EOD Summary*\n\n"
+    msg += f"🏃 *Sprint:* {stats['active_sprint']} — {health}% complete\n"
+    msg += f"📊 {stats['done_pts']:.0f}/{stats['total_pts']:.0f} pts done\n"
+
+    if moved_today:
+        msg += f"\n📝 *Updated today ({len(moved_today)}):*\n"
+        for issue in moved_today[:10]:
+            f = issue["fields"]
+            status = (f.get("status") or {}).get("name", "?")
+            msg += f"  • {issue['key']} → {status} — {f.get('summary', '')[:45]}\n"
+        if len(moved_today) > 10:
+            msg += f"  _...and {len(moved_today) - 10} more_\n"
+
+    if stats["stuck"]:
+        msg += f"\n⚠️ *Still stuck:*\n"
+        for t in stats["stuck"][:5]:
+            msg += f"  • {t['key']} — In Progress for {t['days']}d\n"
+
+    send_telegram(msg)
+    log.info("JOB 10: EOD summary sent.")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# JOB 11: Board Monitor — Quality Gates & Proactive Alerts
+# ══════════════════════════════════════════════════════════════════════════════
+
+def run_board_monitor():
+    """JOB 11: Monitor boards for quality issues and auto-fix or alert."""
+    log.info("JOB 11: Board Monitor")
+    alerts = []
+
+    # ── Auto-fix: Missing story points on non-Epic tickets ────────────────
+    try:
+        data = jira_get("/rest/api/3/search/jql", params={
+            "jql": f'project = AX AND issuetype not in (Epic, Subtask) AND status not in (Done, Released) AND "{STORY_POINTS_FIELD}" is EMPTY ORDER BY rank ASC',
+            "fields": f"summary,issuetype,{STORY_POINTS_FIELD}",
+            "maxResults": 10,
+        })
+        no_points = data.get("issues", [])
+        for issue in no_points:
+            key = issue["key"]
+            summary = issue["fields"].get("summary", "")
+            itype = issue["fields"]["issuetype"]["name"]
+            # AI estimate
+            est_prompt = f"Estimate story points for this Jira {itype}: \"{summary}\". Rules: 0.25=30min, 0.5=1hr, 1=2hrs, 2=4hrs, 3=6hrs. Max 3. Respond with ONLY a number."
+            est = call_claude(est_prompt, max_tokens=10)
+            if est:
+                try:
+                    pts = float(est.strip())
+                    pts = min(max(pts, 0.25), 3)
+                    ok, _ = jira_put(f"/rest/api/3/issue/{key}", {"fields": {STORY_POINTS_FIELD: pts}})
+                    if ok:
+                        log.info(f"  JOB 11: Auto-estimated {key} → {pts}pts")
+                except (ValueError, TypeError):
+                    pass
+    except Exception as e:
+        log.warning(f"JOB 11: Story point check failed: {e}")
+
+    # ── Auto-fix: Epics with all children Done → transition Epic to Done ──
+    try:
+        data = jira_get("/rest/api/3/search/jql", params={
+            "jql": 'project = AX AND issuetype = Epic AND status not in (Done, Released)',
+            "fields": "summary,status",
+            "maxResults": 50,
+        })
+        for epic in data.get("issues", []):
+            epic_key = epic["key"]
+            # Get children
+            children_data = jira_get("/rest/api/3/search/jql", params={
+                "jql": f'project = AX AND parent = {epic_key}',
+                "fields": "status",
+                "maxResults": 100,
+            })
+            children = children_data.get("issues", [])
+            if children and all(
+                (c["fields"].get("status") or {}).get("name", "").lower() in COMPLETED_STATUSES
+                for c in children
+            ):
+                # All children done — transition epic
+                ok, _ = jira_post(f"/rest/api/3/issue/{epic_key}/transitions", {
+                    "transition": {"id": "16"}  # RELEASED
+                })
+                if ok:
+                    log.info(f"  JOB 11: Auto-closed Epic {epic_key} — all children Done")
+                    alerts.append(f"✅ Auto-closed Epic {epic_key} — all children done")
+    except Exception as e:
+        log.warning(f"JOB 11: Epic completion check failed: {e}")
+
+    # ── Auto-fix: Re-enrich Partially reviewed tickets ────────────────────
+    if REVIEWED_FIELD:
+        try:
+            data = jira_get("/rest/api/3/search/jql", params={
+                "jql": 'project = AX AND Reviewed = "Partially" AND status not in (Done, Released)',
+                "fields": "summary",
+                "maxResults": 5,
+            })
+            partial = data.get("issues", [])
+            if partial:
+                log.info(f"  JOB 11: {len(partial)} Partially reviewed tickets found — will be caught by JOB 5")
+        except Exception:
+            pass
+
+    # ── Alert: Sprint over capacity ───────────────────────────────────────
+    try:
+        active = get_active_sprint()
+        if active:
+            sid = active[0]["id"]
+            total_pts = sum((i["fields"].get(STORY_POINTS_FIELD) or 0) for i in get_sprint_issues(sid))
+            if total_pts > MAX_SPRINT_POINTS:
+                alerts.append(f"📊 Sprint at *{total_pts:.0f}/{MAX_SPRINT_POINTS}pts* — over capacity!")
+    except Exception:
+        pass
+
+    # ── Alert: Stuck tickets (In Progress > 3 days) ──────────────────────
+    try:
+        data = jira_get("/rest/api/3/search/jql", params={
+            "jql": 'project = AX AND status = "In Progress" AND updated <= -3d',
+            "fields": "summary,assignee,updated",
+            "maxResults": 10,
+        })
+        stuck = data.get("issues", [])
+        for issue in stuck:
+            f = issue["fields"]
+            assignee = (f.get("assignee") or {}).get("displayName", "Unassigned")
+            alerts.append(f"⚠️ {issue['key']} stuck In Progress — {f.get('summary', '')[:40]} ({assignee})")
+    except Exception:
+        pass
+
+    # ── Alert: PR Review with missing test plan ───────────────────────────
+    try:
+        data = jira_get("/rest/api/3/search/jql", params={
+            "jql": 'project = AX AND status = "PR Review"',
+            "fields": "summary,description",
+            "maxResults": 10,
+        })
+        for issue in data.get("issues", []):
+            desc = issue["fields"].get("description") or ""
+            desc_text = adf_to_text(desc) if isinstance(desc, dict) else str(desc)
+            if "test plan" in desc_text.lower() and "tbd" in desc_text.lower().split("test plan")[-1][:100]:
+                alerts.append(f"🔍 {issue['key']} in PR Review — test plan incomplete")
+    except Exception:
+        pass
+
+    # ── Alert: High priority backlog tickets unactioned ───────────────────
+    try:
+        data = jira_get("/rest/api/3/search/jql", params={
+            "jql": 'project = AX AND status in (Ready, Refine) AND priority in (Highest, High) AND created <= -2d',
+            "fields": "summary,priority,created",
+            "maxResults": 5,
+        })
+        for issue in data.get("issues", []):
+            pri = (issue["fields"].get("priority") or {}).get("name", "?")
+            alerts.append(f"🔥 {issue['key']} ({pri}) sitting in backlog — {issue['fields'].get('summary', '')[:40]}")
+    except Exception:
+        pass
+
+    # Send consolidated alerts
+    if alerts:
+        msg = "🤖 *Board Monitor*\n\n" + "\n".join(alerts)
+        send_telegram(msg)
+        log.info(f"JOB 11: Sent {len(alerts)} alerts to Telegram.")
+    else:
+        log.info("JOB 11: All clear — no issues found.")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# JOB 12: Archive Old Backlog Tickets (>90 days)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def archive_old_backlog():
+    """JOB 12: Move backlog tickets older than 90 days to the Archive project."""
+    log.info("JOB 12: Archive Old Backlog")
+    cutoff = (datetime.now(pytz.utc) - timedelta(days=ARCHIVE_AGE_DAYS)).strftime("%Y-%m-%d")
+    archived = 0
+
+    try:
+        issues, start_at = [], 0
+        while True:
+            data = jira_get("/rest/api/3/search/jql", params={
+                "jql": f'project = AX AND status in (Ready, Refine, Prep) AND created <= "{cutoff}" AND sprint is EMPTY ORDER BY created ASC',
+                "fields": "summary,issuetype,created",
+                "maxResults": 50,
+                "startAt": start_at,
+            })
+            batch = data.get("issues", [])
+            issues.extend(batch)
+            if start_at + len(batch) >= data.get("total", 0):
+                break
+            start_at += len(batch)
+
+        if not issues:
+            log.info("JOB 12: No tickets to archive.")
+            return
+
+        log.info(f"JOB 12: Found {len(issues)} tickets older than {ARCHIVE_AGE_DAYS} days.")
+
+        for issue in issues:
+            key = issue["key"]
+            itype = issue["fields"]["issuetype"]["name"]
+            target_type = ARCHIVE_TYPE_MAP.get(itype, "Task")
+
+            try:
+                ok, resp = jira_put(f"/rest/api/3/issue/{key}", {
+                    "fields": {
+                        "project": {"key": ARCHIVE_PROJECT_KEY},
+                        "issuetype": {"name": target_type},
+                    }
+                })
+                if ok:
+                    archived += 1
+                    log.info(f"  Archived {key} → {ARCHIVE_PROJECT_KEY} (as {target_type})")
+                else:
+                    log.warning(f"  Failed to archive {key}: {resp.status_code} {resp.text[:200]}")
+            except Exception as e:
+                log.warning(f"  Failed to archive {key}: {e}")
+
+        if archived > 0:
+            send_telegram(f"🗄 *Archived {archived} tickets* older than {ARCHIVE_AGE_DAYS} days from backlog → {ARCHIVE_PROJECT_KEY}")
+
+    except Exception as e:
+        log.error(f"JOB 12 failed: {e}", exc_info=True)
+
+    log.info(f"JOB 12: Archived {archived} tickets.")
 
 def run():
     log.info("=== Starting Jira prioritisation run ===")
@@ -1648,6 +2010,12 @@ def run():
         log.info("JOB 6: Process User Feedback Ideas")
         process_user_feedback()
 
+        log.info("JOB 11: Board Monitor")
+        run_board_monitor()
+
+        log.info("JOB 12: Archive Old Backlog")
+        archive_old_backlog()
+
         log.info("=== Run complete ===")
     except Exception as e:
         log.error(f"Run failed: {e}", exc_info=True)
@@ -1658,18 +2026,41 @@ if __name__ == "__main__":
 
     sydney_tz = pytz.timezone("Australia/Sydney")
     scheduler = BlockingScheduler(timezone=sydney_tz)
-    for hour, minute, name in [(7, 0, "7:00am"), (12, 0, "12:00pm"), (16, 0, "4:00pm")]:
-        scheduler.add_job(run, trigger=CronTrigger(day_of_week="mon-fri", hour=hour, minute=minute, timezone=sydney_tz), id=name, name=f"{name} Sydney Run")
-    log.info("Scheduler started — running at 7:00am, 12:00pm, 4:00pm AEDT Mon-Fri.")
+
+    # Core jobs run every 30 minutes during work hours (7am-6pm Mon-Fri)
+    scheduler.add_job(
+        run,
+        trigger=CronTrigger(day_of_week="mon-fri", hour="7-17", minute="0,30", timezone=sydney_tz),
+        id="core_loop",
+        name="Core 30-min loop (7am-5:30pm)",
+    )
+
+    # Morning briefing — 7:30am Mon-Fri
+    scheduler.add_job(
+        send_morning_briefing,
+        trigger=CronTrigger(day_of_week="mon-fri", hour=7, minute=30, timezone=sydney_tz),
+        id="morning_briefing",
+        name="Morning Briefing",
+    )
+
+    # EOD summary — 5:00pm Mon-Fri
+    scheduler.add_job(
+        send_eod_summary,
+        trigger=CronTrigger(day_of_week="mon-fri", hour=17, minute=0, timezone=sydney_tz),
+        id="eod_summary",
+        name="EOD Summary",
+    )
+
+    log.info("Scheduler started — core loop every 30min (7am-6pm), briefing 7:30am, EOD 5pm AEDT Mon-Fri.")
     discover_reviewed_field()
 
     # Start Telegram bot in a daemon thread (runs alongside scheduler)
     if TELEGRAM_BOT_TOKEN:
         tg_thread = threading.Thread(target=start_telegram_bot, daemon=True)
         tg_thread.start()
-        log.info("JOB 7: Telegram bot thread started.")
+        log.info("Telegram bot thread started.")
     else:
-        log.info("JOB 7: Skipped — TELEGRAM_BOT_TOKEN not set.")
+        log.info("Telegram bot skipped — TELEGRAM_BOT_TOKEN not set.")
 
     run()
     scheduler.start()
