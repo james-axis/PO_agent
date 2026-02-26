@@ -1450,7 +1450,27 @@ def start_telegram_bot():
             if text:
                 bot.send_message(message.chat.id, f"📝 Heard: _{text}_", parse_mode="Markdown")
                 state = user_mode.get(message.chat.id, {"mode": "roadmap", "swimlane": STRATEGIC_INITIATIVES_ID})
-                if state["mode"] == "backlog":
+                if state.get("mode") == "weekly":
+                    # Treat voice as a callout in weekly mode
+                    page_id = state.get("page_id")
+                    this_week_exists = state.get("this_week_exists", True)
+                    if this_week_exists:
+                        polished = add_callout_to_weekly(page_id, text)
+                        if polished:
+                            bot.send_message(message.chat.id,
+                                f"📢 Callout added to the page:\n_{polished}_\n\nSend more or /done to finish.",
+                                parse_mode="Markdown")
+                        else:
+                            bot.send_message(message.chat.id, "❌ Failed to add callout to the page.")
+                    else:
+                        polished = polish_callout(text)
+                        pending_weekly_callouts.append(polished)
+                        bot.send_message(message.chat.id,
+                            f"📢 Callout buffered for Friday's page:\n_{polished}_\n"
+                            f"({len(pending_weekly_callouts)} callout(s) queued)\n\n"
+                            f"Send more or /done to finish.",
+                            parse_mode="Markdown")
+                elif state["mode"] == "backlog":
                     process_telegram_work(text, message.chat.id, bot)
                 else:
                     process_telegram_idea(text, message.chat.id, bot, swimlane_id=state["swimlane"])
