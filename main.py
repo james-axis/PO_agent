@@ -2352,52 +2352,22 @@ def micro_decompose_tickets():
             log.warning(f"  Skipping {key} — no split tickets were created successfully.")
             continue
 
-        # Mark original as [SPLIT] — same pattern as JOB 5
-        split_note = f"This ticket has been micro-decomposed into {len(created_keys)} smaller tickets: {', '.join(created_keys)}."
-        if issue_type == "Task":
-            split_desc = f"""**Product Manager:**
-1. **Summary:** {split_note}
-2. **User story:** See split tickets.
-3. **Acceptance criteria:**
-- [ ] All split tickets completed
-4. **Test plan:**
-Verify all split tickets pass their individual acceptance criteria.
-
-**Engineer:**
-1. **Technical plan:**
-2. **Story points estimated:**
-3. **Task broken down (<=3 story points or split into parts):** Yes
-
-{DOR_DOD_TASK}"""
-        elif issue_type == "Bug":
-            split_desc = f"""**Product Manager:**
-1. **Summary:** {split_note}
-
-**Engineer:**
-1. **Investigation:** See split tickets.
-
-{DOR_DOD_TASK}"""
-        else:  # Maintenance
-            split_desc = f"""**Product Manager:**
-1. **Summary:** {split_note}
-
-**Engineer:**
-1. **Task:** See split tickets.
-
-{DOR_DOD_TASK}"""
-
-        update_issue_fields(
-            key,
-            summary=f"[SPLIT] {summary}",
-            description_md=split_desc,
-            story_points=0,
-            reviewed_value="Yes",
-        )
-
-        # Add micro-decomposed label to prevent reprocessing
-        jira_put(f"/rest/api/3/issue/{key}", {
-            "update": {"labels": [{"add": MICRO_LABEL}]}
+        # Archive the original — move to ARU project since it's been replaced by split tickets
+        target_type = ARCHIVE_TYPE_MAP.get(issue_type, "Task")
+        ok, resp = jira_put(f"/rest/api/3/issue/{key}", {
+            "fields": {
+                "project": {"key": ARCHIVE_PROJECT_KEY},
+                "issuetype": {"name": target_type},
+            }
         })
+        if ok:
+            log.info(f"  Archived {key} → {ARCHIVE_PROJECT_KEY}")
+        else:
+            log.warning(f"  Failed to archive {key}: {resp.status_code if resp else 'no response'} — adding label instead")
+            # Fallback: just label it so it's not reprocessed
+            jira_put(f"/rest/api/3/issue/{key}", {
+                "update": {"labels": [{"add": MICRO_LABEL}]}
+            })
 
         processed += 1
         log.info(f"  Completed {key} → {len(created_keys)} tickets ({total_sp}SP total).")
