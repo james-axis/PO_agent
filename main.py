@@ -1226,10 +1226,8 @@ def process_telegram_idea(user_text, chat_id, bot):
 
         link = f"https://axiscrm.atlassian.net/jira/polaris/projects/AR/ideas/view/11184018?selectedIssue={issue_key}"
         msg = (
-            f"✅ *{issue_key}* created!\n\n"
-            f"📌 *{summary}*\n"
-            f"📅 Roadmap: Backlog\n"
-            f"🏷 Initiative: {init_module} · {init_stage} · {init_scope}\n"
+            f"✅ *{issue_key}* — {summary}\n\n"
+            f"🏷 {init_module} · {init_stage} · {init_scope}\n"
             f"📊 RICE: R{rice_r} I{rice_i} C{rice_c} E{rice_e}\n\n"
             f"[Open on board]({link})"
         )
@@ -1251,21 +1249,32 @@ def start_telegram_bot():
         return
 
     bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
+    # Track which mode each user is in (default: idea)
+    user_mode = {}
 
     @bot.message_handler(commands=["start", "help"])
     def handle_start(message):
         bot.reply_to(message,
-            "👋 *Alfred — Axis CRM Idea Bot*\n\n"
-            "Send me a text or voice note describing a product idea and I'll create it on the Strategic Roadmap board.\n\n"
-            "*Tips:*\n"
-            "• Mention the sprint column: _\"for March S2\"_\n"
-            "• Mention the module: _\"payments module\"_ or _\"compliance\"_\n"
-            "• Just describe the problem and I'll figure out the rest\n\n"
-            "*Example:*\n"
-            "_\"New idea for April S1 — adviser commission alerts in the payments module. "
-            "Advisers don't know when clawbacks are coming until it's too late...\"_",
+            "👋 *Alfred — Axis CRM Bot*\n\n"
+            "Two modes:\n\n"
+            "*🧠 /idea* — Create a JPD idea on the Strategic Roadmap\n"
+            "Send a text or voice note and I'll create a fully-formed idea in Backlog.\n\n"
+            "*🔨 /work* — Create an Epic + child tickets in Sprints\n"
+            "Describe what needs building and I'll create an Epic with broken-down tasks, all linked and ≤3pts each.\n\n"
+            "*Current mode:* /idea (default)\n"
+            "Switch anytime with /idea or /work, then send your message.",
             parse_mode="Markdown"
         )
+
+    @bot.message_handler(commands=["idea"])
+    def handle_idea_mode(message):
+        user_mode[message.chat.id] = "idea"
+        bot.reply_to(message, "🧠 *Idea mode* — send a text or voice note and I'll create a JPD idea on the Strategic Roadmap.", parse_mode="Markdown")
+
+    @bot.message_handler(commands=["work"])
+    def handle_work_mode(message):
+        user_mode[message.chat.id] = "work"
+        bot.reply_to(message, "🔨 *Work mode* — send a text or voice note and I'll create an Epic with broken-down tickets in Sprints.", parse_mode="Markdown")
 
     @bot.message_handler(content_types=["voice"])
     def handle_voice(message):
@@ -1280,26 +1289,284 @@ def start_telegram_bot():
             text = transcribe_voice(tmp_path)
             if text:
                 bot.send_message(message.chat.id, f"📝 Heard: _{text}_", parse_mode="Markdown")
-                process_telegram_idea(text, message.chat.id, bot)
+                mode = user_mode.get(message.chat.id, "idea")
+                if mode == "work":
+                    process_telegram_work(text, message.chat.id, bot)
+                else:
+                    process_telegram_idea(text, message.chat.id, bot)
             else:
                 bot.send_message(message.chat.id, "❌ Couldn't transcribe the voice note. Try sending it as text instead.")
         except Exception as e:
-            log.error(f"JOB 7: Voice handling error: {e}")
+            log.error(f"Telegram voice handling error: {e}")
             bot.send_message(message.chat.id, f"❌ Error processing voice note: {e}")
 
     @bot.message_handler(content_types=["text"])
     def handle_text(message):
-        # Skip if it looks like a command we don't handle
         if message.text.startswith("/"):
-            bot.reply_to(message, "Unknown command. Just send me a text or voice note with your idea!")
+            bot.reply_to(message, "Unknown command. Try /idea, /work, or /help")
             return
-        process_telegram_idea(message.text, message.chat.id, bot)
+        mode = user_mode.get(message.chat.id, "idea")
+        if mode == "work":
+            process_telegram_work(message.text, message.chat.id, bot)
+        else:
+            process_telegram_idea(message.text, message.chat.id, bot)
 
     log.info("JOB 7: Telegram bot starting (polling)...")
     try:
         bot.infinity_polling(timeout=20, long_polling_timeout=20)
     except Exception as e:
         log.error(f"JOB 7: Telegram bot crashed: {e}", exc_info=True)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# JOB 8: Telegram Bot — Create AX Epic + Child Tickets from Voice/Text
+# ══════════════════════════════════════════════════════════════════════════════
+
+READY_TRANSITION_ID = "7"
+
+AX_DESCRIPTION_TEMPLATES = {
+    "Task": """**Product Manager:**
+1. **Summary:** {summary}
+2. **User story:** {user_story}
+3. **Acceptance criteria:**
+{acceptance_criteria}
+4. **Test plan:**
+{test_plan}
+
+**Engineer:**
+1. **Technical plan:**
+2. **Story points estimated:**
+3. **Task broken down (<=3 story points or split into parts):**
+
+{dor_dod}""",
+
+    "Epic": """**Product Manager:**
+1. **Summary:** {summary}
+2. **Validated:** No
+3. **RICE score:**
+4. **PRD:**
+
+{dor_dod}""",
+
+    "Maintenance": """**Product Manager:**
+1. **Summary:** {summary}
+
+**Engineer:**
+1. **Task:**
+
+{dor_dod}""",
+
+    "Bug": """**Product Manager:**
+1. **Summary:** {summary}
+
+**Engineer:**
+1. **Investigation:**
+
+{dor_dod}""",
+}
+AX_DESCRIPTION_TEMPLATES["Support"] = AX_DESCRIPTION_TEMPLATES["Bug"]
+AX_DESCRIPTION_TEMPLATES["Spike"] = AX_DESCRIPTION_TEMPLATES["Bug"]
+
+
+def build_work_breakdown_prompt(user_text):
+    """Build the Claude prompt to structure a Telegram message into an AX Epic + child tickets."""
+    return f"""You are a senior Product Manager for Axis CRM, a life insurance distribution CRM platform.
+The platform is used by AFSL-licensed insurance advisers to manage clients, policies, applications, quotes, payments and commissions.
+Partner insurers include TAL, Zurich, AIA, MLC Life, MetLife, Resolution Life, Integrity Life and others.
+The CRM serves multiple divisions: LIP (lead intake & processing) team, services team, and advisers.
+
+A product requirement has been submitted via Telegram (possibly from a voice note transcription — it may be informal).
+Your job is to:
+1. Create an Epic that captures the overall initiative
+2. Break it down into individual shippable tickets (Task, Bug, Spike, Support, Maintenance)
+3. Each ticket must be <=3 story points (3pts = 6hrs, 2pts = 4hrs, 1pt = 2hrs, 0.5pt = 1hr, 0.25pt = 30min)
+
+USER INPUT:
+{user_text}
+
+Respond with ONLY a JSON object (no markdown, no backticks, no explanation):
+
+{{
+  "epic": {{
+    "summary": "Concise epic title",
+    "description_summary": "One paragraph describing the epic scope and goals",
+    "priority": "Medium"
+  }},
+  "tickets": [
+    {{
+      "type": "Task",
+      "summary": "Clear task summary as a user story where appropriate",
+      "priority": "Medium",
+      "story_points": 2,
+      "user_story": "As a [user], I want [goal] so that [benefit]",
+      "acceptance_criteria": ["Criterion 1", "Criterion 2"],
+      "test_plan": ["Test step 1", "Test step 2"]
+    }},
+    {{
+      "type": "Spike",
+      "summary": "Investigation: [what needs investigating]",
+      "priority": "High",
+      "story_points": 1,
+      "investigation_summary": "Brief description of what to investigate"
+    }}
+  ]
+}}
+
+RULES:
+- ALWAYS create at least 2 tickets under the epic.
+- Ticket types: Task, Bug, Spike, Support, Maintenance. Choose the most appropriate for each piece of work.
+- Tasks MUST include user_story, acceptance_criteria (array), and test_plan (array).
+- Bug, Spike, Support only need summary and investigation_summary.
+- Maintenance only needs summary.
+- NO ticket can exceed 3 story points. If work is large, split into multiple tickets.
+- story_points must be one of: 0.25, 0.5, 1, 2, 3.
+- Priority: choose from Lowest, Low, Medium, High, Highest based on urgency/impact.
+- Epic priority should reflect the overall importance.
+- Write substantive descriptions — don't just parrot the input.
+- Think about what a developer actually needs to build this."""
+
+
+def create_ax_ticket(ticket_data, issue_type, parent_key=None):
+    """Create a single AX ticket with the correct description template."""
+    summary = ticket_data.get("summary", "Untitled")
+    priority = ticket_data.get("priority", "Medium")
+    story_points = ticket_data.get("story_points")
+
+    # Build description from template
+    if issue_type == "Task":
+        ac_items = ticket_data.get("acceptance_criteria", [])
+        ac_str = "\n".join(f"   - {item}" for item in ac_items) if ac_items else "   - TBD"
+        tp_items = ticket_data.get("test_plan", [])
+        tp_str = "\n".join(f"   - {item}" for item in tp_items) if tp_items else "   - TBD"
+        desc_md = AX_DESCRIPTION_TEMPLATES["Task"].format(
+            summary=summary,
+            user_story=ticket_data.get("user_story", ""),
+            acceptance_criteria=ac_str,
+            test_plan=tp_str,
+            dor_dod=DOR_DOD_TASK,
+        )
+    elif issue_type == "Epic":
+        desc_md = AX_DESCRIPTION_TEMPLATES["Epic"].format(
+            summary=ticket_data.get("description_summary", summary),
+            dor_dod=DOR_DOD_EPIC,
+        )
+    elif issue_type == "Maintenance":
+        desc_md = AX_DESCRIPTION_TEMPLATES["Maintenance"].format(
+            summary=summary,
+            dor_dod=DOR_DOD_TASK,
+        )
+    else:  # Bug, Spike, Support
+        inv = ticket_data.get("investigation_summary", summary)
+        desc_md = AX_DESCRIPTION_TEMPLATES.get(issue_type, AX_DESCRIPTION_TEMPLATES["Bug"]).format(
+            summary=inv,
+            dor_dod=DOR_DOD_TASK,
+        )
+
+    fields = {
+        "project": {"key": "AX"},
+        "issuetype": {"name": issue_type},
+        "summary": summary,
+        "description": {"version": 1, "type": "doc", "content": markdown_to_adf(desc_md)},
+        "assignee": {"accountId": ANDREJ_ID},
+        "priority": {"name": priority},
+    }
+
+    # Parent (for child tickets under Epic)
+    if parent_key and issue_type != "Epic":
+        fields["parent"] = {"key": parent_key}
+
+    # Story points (not for Epics)
+    if story_points and issue_type != "Epic":
+        fields[STORY_POINTS_FIELD] = float(story_points)
+
+    ok, resp = jira_post("/rest/api/3/issue", {"fields": fields})
+    if ok:
+        issue_key = resp.json().get("key", "?")
+        log.info(f"  JOB 8: Created {issue_type} {issue_key}: {summary}")
+        return issue_key
+    else:
+        log.error(f"  JOB 8: Failed to create {issue_type}: {resp.status_code} {resp.text[:300]}")
+        return None
+
+
+def transition_to_ready(issue_key):
+    """Transition an AX ticket to Ready status."""
+    ok, resp = jira_post(f"/rest/api/3/issue/{issue_key}/transitions", {
+        "transition": {"id": READY_TRANSITION_ID}
+    })
+    if ok:
+        log.info(f"  JOB 8: Transitioned {issue_key} → Ready")
+    else:
+        log.warning(f"  JOB 8: Failed to transition {issue_key}: {resp.status_code} {resp.text[:200]}")
+    return ok
+
+
+def process_telegram_work(user_text, chat_id, bot):
+    """Full pipeline: text → Claude breakdown → Epic + child tickets → Telegram reply."""
+    if not user_text or not user_text.strip():
+        bot.send_message(chat_id, "❌ Couldn't understand the message. Please try again.")
+        return
+
+    bot.send_message(chat_id, "🔨 Breaking down your work into tickets...")
+
+    # Call Claude to structure the work
+    prompt = build_work_breakdown_prompt(user_text)
+    response = call_claude(prompt, max_tokens=4096)
+    if not response:
+        bot.send_message(chat_id, "❌ Failed to process with AI. Check the Anthropic API key.")
+        return
+
+    # Parse Claude's JSON response
+    try:
+        clean = re.sub(r'^```(?:json)?\s*', '', response)
+        clean = re.sub(r'\s*```$', '', clean)
+        structured = json.loads(clean)
+    except json.JSONDecodeError as e:
+        log.error(f"  JOB 8: JSON parse error: {e}\nRaw response: {response[:500]}")
+        bot.send_message(chat_id, "❌ Failed to parse AI response. Please try again.")
+        return
+
+    # Step 1: Create the Epic
+    epic_data = structured.get("epic", {})
+    epic_key = create_ax_ticket(epic_data, "Epic")
+    if not epic_key:
+        bot.send_message(chat_id, "❌ Failed to create the Epic in Jira. Check the logs.")
+        return
+    transition_to_ready(epic_key)
+
+    # Step 2: Create child tickets
+    tickets = structured.get("tickets", [])
+    created_tickets = []
+    total_points = 0
+    for ticket in tickets:
+        ticket_type = ticket.get("type", "Task")
+        if ticket_type not in ("Task", "Bug", "Spike", "Support", "Maintenance"):
+            ticket_type = "Task"
+        child_key = create_ax_ticket(ticket, ticket_type, parent_key=epic_key)
+        if child_key:
+            transition_to_ready(child_key)
+            pts = ticket.get("story_points", 0) or 0
+            total_points += pts
+            created_tickets.append({
+                "key": child_key,
+                "type": ticket_type,
+                "summary": ticket.get("summary", ""),
+                "points": pts,
+            })
+
+    # Step 3: Send summary to Telegram
+    epic_link = f"https://axiscrm.atlassian.net/browse/{epic_key}"
+    ticket_lines = "\n".join(
+        f"  • {t['key']} ({t['type']}, {t['points']}pts) — {t['summary'][:60]}"
+        for t in created_tickets
+    )
+    msg = (
+        f"✅ *{epic_key}* — {epic_data.get('summary', 'Epic')}\n\n"
+        f"📋 *{len(created_tickets)} tickets created* ({total_points} total pts):\n"
+        f"{ticket_lines}\n\n"
+        f"[Open epic]({epic_link})"
+    )
+    bot.send_message(chat_id, msg, parse_mode="Markdown", disable_web_page_preview=True)
 
 
 # ── Main run ──────────────────────────────────────────────────────────────────
