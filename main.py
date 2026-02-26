@@ -1223,10 +1223,14 @@ def process_telegram_idea(user_text, chat_id, bot, swimlane_id=None):
         init_module = structured.get("initiative_module", "?")
         init_stage = structured.get("initiative_stage", "?")
         init_scope = structured.get("initiative_scope", "?")
-        rice_r = structured.get("rice_reach", "?")
-        rice_i = structured.get("rice_impact", "?")
-        rice_c = structured.get("rice_confidence", "?")
-        rice_e = structured.get("rice_effort", "?")
+        rice_r = structured.get("rice_reach", 3)
+        rice_i = structured.get("rice_impact", 3)
+        rice_c = structured.get("rice_confidence", 3)
+        rice_e = structured.get("rice_effort", 3)
+        try:
+            rice_value = (int(rice_r) * int(rice_i) * int(rice_c)) / int(rice_e)
+        except (ValueError, ZeroDivisionError):
+            rice_value = 0
 
         link = f"https://axiscrm.atlassian.net/jira/polaris/projects/AR/ideas/view/11184018?selectedIssue={issue_key}"
         lane_name = "User Feedback" if swimlane_id == USER_FEEDBACK_OPTION_ID else "Strategic Initiatives"
@@ -1234,7 +1238,7 @@ def process_telegram_idea(user_text, chat_id, bot, swimlane_id=None):
             f"✅ *{issue_key}* — {summary}\n\n"
             f"🏊 {lane_name}\n"
             f"🏷 {init_module} · {init_stage} · {init_scope}\n"
-            f"📊 RICE: R{rice_r} I{rice_i} C{rice_c} E{rice_e}\n\n"
+            f"📊 Value: {rice_value:.1f} / 125\n\n"
             f"[Open on board]({link})"
         )
         bot.send_message(chat_id, msg, parse_mode="Markdown", disable_web_page_preview=True)
