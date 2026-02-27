@@ -1063,7 +1063,7 @@ def update_ar_idea(issue_key, cleaned_desc=None, vote_rating=None):
 
 def prioritise_feedback_ideas():
     """Re-prioritise all scored User Feedback ideas across Roadmap columns by Vote (5=highest, 0=backlog)."""
-    jql = f'project = {AR_PROJECT_KEY} AND cf[10694] = "User Feedback" AND status != Done AND cf[10695] is not EMPTY'
+    jql = f'project = {AR_PROJECT_KEY} AND cf[10694] = "User Feedback" AND status != Done'
     fields = f"summary,{VOTE_FIELD},{ROADMAP_FIELD}"
     issues, start_at = [], 0
     while True:
@@ -2878,11 +2878,10 @@ def discover_delivery_link_type():
 
 
 def get_strategic_ideas_scored():
-    """Fetch all Strategic Initiatives ideas that have a Vote rating."""
+    """Fetch all Strategic Initiatives ideas (scored and unscored)."""
     jql = (
         f'project = {AR_PROJECT_KEY} AND cf[10694] = "Strategic Initiatives"'
         f' AND status != Done'
-        f' AND cf[10695] is not EMPTY'
     )
     fields = (
         f"summary,description,status,priority,issuelinks,"
