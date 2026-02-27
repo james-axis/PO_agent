@@ -1133,14 +1133,11 @@ Verify all split tickets pass their individual test plans.
 # JOB 6: User Feedback Idea Processing (AR Strategic Roadmap)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def get_user_feedback_ideas(scored_only=False):
-    """Fetch AR ideas in the 'User Feedback' swimlane."""
+def get_user_feedback_ideas(unaligned_only=False):
+    """Fetch AR ideas in the 'User Feedback' swimlane.
+    If unaligned_only=True, only return ideas whose initiative is still VoA (not yet aligned to an SI)."""
     jql = f'project = {AR_PROJECT_KEY} AND cf[10694] = "User Feedback" AND status != Done'
-    if scored_only:
-        jql += f' AND cf[10834] is not EMPTY'
-    else:
-        jql += f' AND cf[10834] is EMPTY'
-    fields = f"summary,description,status,priority,labels,{ROADMAP_FIELD},{SWIMLANE_FIELD},{ADVISER_FIELD}"
+    fields = f"summary,description,status,priority,labels,{ROADMAP_FIELD},{SWIMLANE_FIELD},{ADVISER_FIELD},{INITIATIVE_FIELD}"
     issues, start_at = [], 0
     while True:
         data = jira_get("/rest/api/3/search/jql", params={"jql": jql, "fields": fields, "maxResults": 50, "startAt": start_at})
@@ -1150,6 +1147,17 @@ def get_user_feedback_ideas(scored_only=False):
         if start_at + len(batch) >= total:
             break
         start_at += len(batch)
+
+    if unaligned_only:
+        voa_id = INITIATIVE_OPTIONS.get("voa")
+        result = []
+        for issue in issues:
+            initiatives = issue["fields"].get(INITIATIVE_FIELD) or []
+            init_ids = {i.get("id") for i in initiatives if isinstance(i, dict)}
+            # Still VoA-only or no initiative at all → needs alignment
+            if not init_ids or init_ids == {voa_id}:
+                result.append(issue)
+        return result
     return issues
 
 
@@ -1207,22 +1215,132 @@ def update_ar_idea(issue_key, cleaned_desc=None):
     return ok
 
 
-def prioritise_feedback_ideas():
-    """Roadmap is manually managed — feedback ideas are placed in columns by the user."""
-    log.info("  Feedback idea prioritisation skipped — roadmap is manually managed.")
+def align_feedback_to_strategic():
+    """Align User Feedback ideas to their matching Strategic Initiative.
+    For each feedback idea still tagged VoA, Claude matches it to the best SI by content.
+    Then copies the SI's initiative values and roadmap column onto the feedback idea."""
+    if not ANTHROPIC_API_KEY:
+        log.info("  Feedback alignment skipped — ANTHROPIC_API_KEY not set.")
+        return
+
+    # Fetch all SI ideas as the reference catalog
+    si_ideas = get_strategic_ideas_scored()
+    if not si_ideas:
+        log.info("  No Strategic Initiative ideas found — skipping alignment.")
+        return
+
+    # Build catalog: key → {summary, initiative_ids, roadmap_col_id}
+    si_catalog = {}
+    si_summary_lines = []
+    for si in si_ideas:
+        f = si["fields"]
+        col_id = (f.get(ROADMAP_FIELD) or {}).get("id")
+        col_name = "Backlog"
+        for col in ROADMAP_COLUMNS:
+            if col["id"] == col_id:
+                col_name = col["value"]
+                break
+        if col_id == ROADMAP_BACKLOG_ID:
+            col_name = "Backlog"
+        init_values = f.get(INITIATIVE_FIELD) or []
+        si_catalog[si["key"]] = {
+            "summary": f["summary"],
+            "initiative_ids": [i["id"] for i in init_values if isinstance(i, dict)],
+            "roadmap_col_id": col_id,
+            "roadmap_col_name": col_name,
+        }
+        si_summary_lines.append(f"- {si['key']}: {f['summary']} [Column: {col_name}]")
+
+    si_catalog_text = "\n".join(si_summary_lines)
+
+    # Fetch unaligned feedback ideas (still VoA or no initiative)
+    feedback_ideas = get_user_feedback_ideas(unaligned_only=True)
+    if not feedback_ideas:
+        log.info("  All feedback ideas already aligned — nothing to do.")
+        return
+
+    log.info(f"  Aligning {len(feedback_ideas)} feedback idea(s) to Strategic Initiatives...")
+
+    aligned = 0
+    for fb in feedback_ideas:
+        fb_key = fb["key"]
+        fb_f = fb["fields"]
+        fb_summary = fb_f["summary"]
+        fb_desc = fb_f.get("description") or ""
+        if isinstance(fb_desc, dict):
+            fb_desc = adf_to_text(fb_desc)
+
+        prompt = f"""You are a Product Manager for Axis CRM, a life insurance distribution CRM platform.
+
+A User Feedback idea needs to be matched to the Strategic Initiative it most closely relates to.
+
+FEEDBACK IDEA:
+Key: {fb_key}
+Summary: {fb_summary}
+Description (quotes from advisers):
+{fb_desc[:2000]}
+
+STRATEGIC INITIATIVES CATALOG:
+{si_catalog_text}
+
+Which Strategic Initiative does this feedback idea best align with?
+Consider the topic, module, feature area, and user need described in the feedback.
+
+If NONE of the Strategic Initiatives are a reasonable match, respond with "NONE".
+
+RESPOND WITH ONLY the issue key (e.g. "AR-42") or "NONE". No explanation, no markdown."""
+
+        response = call_claude(prompt)
+        if not response:
+            log.warning(f"    {fb_key}: Claude matching failed — skipping.")
+            continue
+
+        matched_key = response.strip().upper()
+        if matched_key == "NONE" or matched_key not in si_catalog:
+            log.info(f"    {fb_key}: No matching SI found — leaving as VoA.")
+            continue
+
+        matched = si_catalog[matched_key]
+        update_fields = {}
+
+        # Copy initiative from SI
+        if matched["initiative_ids"]:
+            update_fields[INITIATIVE_FIELD] = [{"id": iid} for iid in matched["initiative_ids"]]
+
+        # Copy roadmap column from SI
+        if matched["roadmap_col_id"]:
+            current_col = (fb_f.get(ROADMAP_FIELD) or {}).get("id")
+            if current_col != matched["roadmap_col_id"]:
+                update_fields[ROADMAP_FIELD] = {"id": matched["roadmap_col_id"]}
+
+        if update_fields:
+            ok, resp = jira_put(f"/rest/api/3/issue/{fb_key}", {"fields": update_fields})
+            if ok:
+                init_names = ", ".join(
+                    k.title() for k, v in INITIATIVE_OPTIONS.items()
+                    if v in matched["initiative_ids"]
+                )
+                log.info(f"    {fb_key} → {matched_key} ({matched['summary'][:50]}) | Initiative: {init_names} | Column: {matched['roadmap_col_name']}")
+                aligned += 1
+            else:
+                log.warning(f"    {fb_key}: Failed to update: {resp.status_code}")
+        else:
+            log.info(f"    {fb_key} → {matched_key} (already aligned)")
+
+    log.info(f"  Feedback alignment complete: {aligned} idea(s) aligned.")
 
 
 def process_user_feedback():
-    """JOB 6: Process User Feedback ideas — clean descriptions."""
+    """JOB 6: Process User Feedback ideas — clean descriptions, align to Strategic Initiatives."""
     if not ANTHROPIC_API_KEY:
         log.info("JOB 6 skipped — ANTHROPIC_API_KEY not set.")
         return
 
-    # Step 1: Find unscored User Feedback ideas
-    unscored = get_user_feedback_ideas(scored_only=False)
-    if unscored:
-        log.info(f"JOB 6: Found {len(unscored)} unscored User Feedback idea(s) to process.")
-        for issue in unscored:
+    # Step 1: Clean descriptions for unaligned feedback ideas
+    unaligned = get_user_feedback_ideas(unaligned_only=True)
+    if unaligned:
+        log.info(f"JOB 6: Found {len(unaligned)} unaligned User Feedback idea(s) to process.")
+        for issue in unaligned:
             key = issue["key"]
             summary = issue["fields"]["summary"]
             log.info(f"  Processing {key}: {summary}")
@@ -1249,11 +1367,11 @@ def process_user_feedback():
             else:
                 log.warning(f"  Failed to update {key}")
     else:
-        log.info("JOB 6: No unscored User Feedback ideas found.")
+        log.info("JOB 6: All feedback ideas already processed.")
 
-    # Step 2: Re-prioritise ALL scored ideas across the roadmap
-    log.info("JOB 6: Re-prioritising User Feedback ideas across roadmap columns.")
-    prioritise_feedback_ideas()
+    # Step 2: Align feedback ideas to Strategic Initiatives (initiative + roadmap column)
+    log.info("JOB 6: Aligning User Feedback ideas to Strategic Initiatives.")
+    align_feedback_to_strategic()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2953,7 +3071,7 @@ def get_strategic_ideas_scored():
     )
     fields = (
         f"summary,description,status,priority,issuelinks,"
-        f"{ROADMAP_FIELD},{SWIMLANE_FIELD}"
+        f"{ROADMAP_FIELD},{SWIMLANE_FIELD},{INITIATIVE_FIELD}"
     )
     issues, start_at = [], 0
     while True:
