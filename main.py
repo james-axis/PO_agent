@@ -379,7 +379,7 @@ def sync_roadmap_to_sprints(future_sprints):
         return
     log.info("JOB 16: Syncing roadmap columns to sprint assignments...")
 
-    # Build sprint_id → column_name mapping
+    # Build sprint_id → column mapping
     sprint_to_column = {}
     for col in ROADMAP_COLUMNS:
         matched = find_sprint_for_column(col["value"], future_sprints)
@@ -391,14 +391,17 @@ def sync_roadmap_to_sprints(future_sprints):
         try:
             data = jira_get("/rest/api/3/search/jql", params={
                 "jql": f'project = AX AND parent = {epic_key} AND status not in (Done, Released)',
-                "fields": "sprint", "maxResults": 1
+                "fields": "customfield_10020", "maxResults": 1
             })
             children = data.get("issues", [])
             if not children:
                 continue
 
-            # Use the sprint of the first child as the canonical sprint
-            child_sprint = children[0]["fields"].get("sprint")
+            child_fields = children[0].get("fields") or {}
+            child_sprint = child_fields.get("customfield_10020")
+            # customfield_10020 can be a list of sprints or a single object
+            if isinstance(child_sprint, list):
+                child_sprint = child_sprint[-1] if child_sprint else None
             if not child_sprint or not child_sprint.get("id"):
                 continue
 
@@ -418,8 +421,9 @@ def sync_roadmap_to_sprints(future_sprints):
             if not epic_issues:
                 continue
 
+            epic_fields = epic_issues[0].get("fields") or {}
             idea_key = None
-            for link in (epic_issues[0]["fields"].get("issuelinks") or []):
+            for link in (epic_fields.get("issuelinks") or []):
                 for direction in ("outwardIssue", "inwardIssue"):
                     linked = link.get(direction)
                     if linked and linked.get("key", "").startswith("AR-"):
