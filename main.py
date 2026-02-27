@@ -58,6 +58,14 @@ ROADMAP_SHIPPED_ID = "10234"
 ROADMAP_DONE_ID    = "10532"
 IDEAS_PER_COLUMN   = 3  # Max ideas per roadmap column (2-3 for first, 3 for rest)
 
+# Column index → priority rank (0 = highest priority, i.e. soonest sprint)
+COLUMN_RANK = {col["id"]: idx for idx, col in enumerate(ROADMAP_COLUMNS)}
+COLUMN_RANK[ROADMAP_BACKLOG_ID] = 999  # Backlog = lowest
+
+# Populated by JOB 15: maps AX Epic key → (column_rank, rice_value)
+# Used by JOB 3/4 to rank tickets by strategic priority
+EPIC_ROADMAP_RANK = {}
+
 # ── Telegram Bot Config ───────────────────────────────────────────────────────
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")  # Auto-captured from first message if not set
@@ -154,29 +162,47 @@ def get_future_sprints():
     return sprints
 
 def get_sprint_issues(sprint_id):
-    return jira_get(f"/rest/agile/1.0/sprint/{sprint_id}/issue", params={"fields": "summary,priority,status", "maxResults": 200}).get("issues", [])
+    return jira_get(f"/rest/agile/1.0/sprint/{sprint_id}/issue", params={"fields": "summary,priority,status,parent", "maxResults": 200}).get("issues", [])
 
 def get_sprint_todo_points(sprint_id):
     return sum((i["fields"].get(STORY_POINTS_FIELD) or 0) for i in get_sprint_issues(sprint_id) if i["fields"]["status"]["name"] == "To Do")
 
 def get_andrej_ready_backlog():
     jql = f'project = AX AND (sprint is EMPTY OR sprint in closedSprints()) AND status = Ready AND status != Released AND assignee = "{ANDREJ_ID}" AND cf[10016] is not EMPTY'
-    issues = jira_get("/rest/api/3/search/jql", params={"jql": jql, "fields": "summary,priority,customfield_10016", "maxResults": 200}).get("issues", [])
-    issues.sort(key=lambda i: PRIORITY_ORDER.get(i["fields"]["priority"]["name"], 999))
+    issues = jira_get("/rest/api/3/search/jql", params={"jql": jql, "fields": "summary,priority,parent,customfield_10016", "maxResults": 200}).get("issues", [])
+    issues.sort(key=lambda i: _roadmap_sort_key(i))
     return issues
 
 def get_backlog_issues():
-    return jira_get("/rest/api/3/search/jql", params={"jql": "project = AX AND (sprint is EMPTY OR sprint in closedSprints()) AND status != Released AND status != Done", "fields": "summary,priority,status,customfield_10020", "maxResults": 200}).get("issues", [])
+    return jira_get("/rest/api/3/search/jql", params={"jql": "project = AX AND (sprint is EMPTY OR sprint in closedSprints()) AND status != Released AND status != Done", "fields": "summary,priority,status,parent,customfield_10020", "maxResults": 200}).get("issues", [])
 
 def move_issue_to_sprint(issue_key, sprint_id):
     ok, _ = jira_post(f"/rest/agile/1.0/sprint/{sprint_id}/issue", {"issues": [issue_key]})
     return ok
 
+
+def _roadmap_sort_key(issue):
+    """Sort key: roadmap column rank (0=soonest) → RICE value (desc) → Jira priority.
+    Tickets connected to the strategic pipeline rank before non-connected ones."""
+    f = issue.get("fields", {})
+    # Trace: ticket → parent Epic → EPIC_ROADMAP_RANK cache
+    parent_key = (f.get("parent") or {}).get("key", "")
+    epic_key = issue["key"] if (f.get("issuetype") or {}).get("name") == "Epic" else parent_key
+
+    if epic_key and epic_key in EPIC_ROADMAP_RANK:
+        col_rank, rice_value = EPIC_ROADMAP_RANK[epic_key]
+        return (col_rank, -rice_value, PRIORITY_ORDER.get((f.get("priority") or {}).get("name", ""), 999))
+
+    # Not connected to strategic pipeline — ranks after all roadmap-driven tickets
+    return (500, 0, PRIORITY_ORDER.get((f.get("priority") or {}).get("name", ""), 999))
+
+
 def rank_issues(issues, label):
+    """Rank issues by strategic roadmap priority, falling back to Jira priority."""
     if len(issues) < 2:
         log.info(f"{label}: only {len(issues)} issue(s), no ranking needed.")
         return
-    issues.sort(key=lambda i: PRIORITY_ORDER.get((i["fields"].get("priority") or {}).get("name", ""), 999))
+    issues.sort(key=_roadmap_sort_key)
     keys = [i["key"] for i in issues]
     log.info(f"{label} — ranking {len(keys)} issues")
     for idx in range(len(keys) - 2, -1, -1):
@@ -2978,17 +3004,35 @@ def get_column_name(roadmap_col_id):
 
 def process_strategic_pipeline():
     """JOB 15: Unified strategic pipeline — AR ideas → roadmap → delivery Epics → child tickets → sprints."""
-    if not ANTHROPIC_API_KEY:
-        log.info("JOB 15 skipped — ANTHROPIC_API_KEY not set.")
-        return
 
-    # ── Step 1: Prioritise strategic ideas across roadmap columns ──
+    # ── Step 1: Prioritise strategic ideas across roadmap columns (no AI needed) ──
     log.info("  JOB 15 Step 1: Prioritising Strategic Initiatives ideas...")
     all_ideas = get_strategic_ideas_scored()
     prioritise_strategic_ideas(all_ideas)
 
     # Re-fetch to get updated roadmap positions (after prioritisation)
     all_ideas = get_strategic_ideas_scored()
+
+    # ── Build the EPIC_ROADMAP_RANK cache for JOB 3/4 ranking (no AI needed) ──
+    log.info("  JOB 15: Building epic → roadmap rank cache for sprint/backlog ranking...")
+    EPIC_ROADMAP_RANK.clear()
+    for idea in all_ideas:
+        f = idea["fields"]
+        col_id = (f.get(ROADMAP_FIELD) or {}).get("id")
+        col_rank = COLUMN_RANK.get(col_id, 999)
+        r = f.get(RICE_REACH_FIELD) or 1
+        i = f.get(RICE_IMPACT_FIELD) or 1
+        c = f.get(RICE_CONFIDENCE_FIELD) or 1
+        e = f.get(RICE_EFFORT_FIELD) or 1
+        rice_value = (r * i * c) / e
+        epic_key = get_idea_delivery_epic(f.get("issuelinks") or [])
+        if epic_key:
+            EPIC_ROADMAP_RANK[epic_key] = (col_rank, rice_value)
+    log.info(f"  JOB 15: Cached {len(EPIC_ROADMAP_RANK)} epic(s) with roadmap ranks.")
+
+    if not ANTHROPIC_API_KEY:
+        log.info("  JOB 15: Skipping epic creation — ANTHROPIC_API_KEY not set.")
+        return
 
     # ── Step 2+3: Create delivery Epics + child tickets for ideas in columns ──
     log.info("  JOB 15 Step 2: Creating delivery Epics for roadmap-placed ideas...")
@@ -3065,6 +3109,18 @@ def process_strategic_pipeline():
         log.info(f"    {idea_key} → created {epic_key}")
         transition_to_ready(epic_key)
         link_idea_to_epic(idea_key, epic_key)
+
+        # Update ranking cache for new epic
+        idea_col_id = (idea["fields"].get(ROADMAP_FIELD) or {}).get("id")
+        idea_f = idea["fields"]
+        _r = idea_f.get(RICE_REACH_FIELD) or 1
+        _i = idea_f.get(RICE_IMPACT_FIELD) or 1
+        _c = idea_f.get(RICE_CONFIDENCE_FIELD) or 1
+        _e = idea_f.get(RICE_EFFORT_FIELD) or 1
+        EPIC_ROADMAP_RANK[epic_key] = (
+            COLUMN_RANK.get(idea_col_id, 999),
+            (_r * _i * _c) / _e
+        )
 
         # Create child tickets
         tickets = structured.get("tickets", [])
