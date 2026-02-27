@@ -865,7 +865,7 @@ Verify all split tickets pass their individual test plans.
 
 def get_user_feedback_ideas(scored_only=False):
     """Fetch AR ideas in the 'User Feedback' swimlane."""
-    jql = f'project = {AR_PROJECT_KEY} AND cf[10694] = "User Feedback"'
+    jql = f'project = {AR_PROJECT_KEY} AND cf[10694] = "User Feedback" AND status != Done'
     if scored_only:
         jql += f' AND cf[10526] is not EMPTY AND cf[10047] is not EMPTY AND cf[10527] is not EMPTY AND cf[10058] is not EMPTY'
     else:
@@ -959,7 +959,7 @@ def update_ar_idea(issue_key, cleaned_desc=None, rice_scores=None):
 
 def prioritise_feedback_ideas():
     """Re-prioritise all scored User Feedback ideas across Roadmap columns by RICE score."""
-    jql = f'project = {AR_PROJECT_KEY} AND cf[10694] = "User Feedback" AND cf[10526] is not EMPTY AND cf[10047] is not EMPTY AND cf[10527] is not EMPTY AND cf[10058] is not EMPTY'
+    jql = f'project = {AR_PROJECT_KEY} AND cf[10694] = "User Feedback" AND status != Done AND cf[10526] is not EMPTY AND cf[10047] is not EMPTY AND cf[10527] is not EMPTY AND cf[10058] is not EMPTY'
     fields = f"summary,{RICE_REACH_FIELD},{RICE_IMPACT_FIELD},{RICE_CONFIDENCE_FIELD},{RICE_EFFORT_FIELD},{ROADMAP_FIELD}"
     issues, start_at = [], 0
     while True:
@@ -2790,6 +2790,7 @@ def get_strategic_ideas_scored():
     """Fetch all Strategic Initiatives ideas that have all 4 RICE scores."""
     jql = (
         f'project = {AR_PROJECT_KEY} AND cf[10694] = "Strategic Initiatives"'
+        f' AND status != Done'
         f' AND cf[10526] is not EMPTY AND cf[10047] is not EMPTY'
         f' AND cf[10527] is not EMPTY AND cf[10058] is not EMPTY'
     )
