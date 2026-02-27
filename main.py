@@ -269,23 +269,147 @@ def get_future_sprints():
     return sprints
 
 def get_sprint_issues(sprint_id):
-    return jira_get(f"/rest/agile/1.0/sprint/{sprint_id}/issue", params={"fields": "summary,priority,status,parent", "maxResults": 200}).get("issues", [])
+    return jira_get(f"/rest/agile/1.0/sprint/{sprint_id}/issue", params={"fields": f"summary,priority,status,parent,{STORY_POINTS_FIELD}", "maxResults": 200}).get("issues", [])
 
 def get_sprint_todo_points(sprint_id):
-    return sum((i["fields"].get(STORY_POINTS_FIELD) or 0) for i in get_sprint_issues(sprint_id) if i["fields"]["status"]["name"] == "To Do")
+    return sum((i["fields"].get(STORY_POINTS_FIELD) or 0) for i in get_sprint_issues(sprint_id) if i["fields"]["status"]["name"] in ("To Do", "Ready"))
 
 def get_andrej_ready_backlog():
     jql = f'project = AX AND (sprint is EMPTY OR sprint in closedSprints()) AND status = Ready AND status != Released AND assignee = "{ANDREJ_ID}" AND cf[10016] is not EMPTY'
-    issues = jira_get("/rest/api/3/search/jql", params={"jql": jql, "fields": "summary,priority,parent,customfield_10016", "maxResults": 200}).get("issues", [])
+    issues = jira_get("/rest/api/3/search/jql", params={"jql": jql, "fields": f"summary,priority,parent,{STORY_POINTS_FIELD}", "maxResults": 200}).get("issues", [])
     issues.sort(key=lambda i: _roadmap_sort_key(i))
     return issues
 
 def get_backlog_issues():
-    return jira_get("/rest/api/3/search/jql", params={"jql": "project = AX AND (sprint is EMPTY OR sprint in closedSprints()) AND status != Released AND status != Done", "fields": "summary,priority,status,parent,customfield_10020", "maxResults": 200}).get("issues", [])
+    return jira_get("/rest/api/3/search/jql", params={"jql": "project = AX AND (sprint is EMPTY OR sprint in closedSprints()) AND status != Released AND status != Done", "fields": f"summary,priority,status,parent,{STORY_POINTS_FIELD}", "maxResults": 200}).get("issues", [])
 
 def move_issue_to_sprint(issue_key, sprint_id):
     ok, _ = jira_post(f"/rest/agile/1.0/sprint/{sprint_id}/issue", {"issues": [issue_key]})
     return ok
+
+
+def rebalance_sprints(future_sprints):
+    """Rebalance future sprints: if any sprint exceeds MAX_SPRINT_POINTS, cascade lowest-priority To Do tickets down."""
+    if not future_sprints:
+        return
+    log.info("JOB 16: Rebalancing future sprints...")
+
+    for i, sprint in enumerate(future_sprints):
+        sid, sname = sprint["id"], sprint["name"]
+        issues = get_sprint_issues(sid)
+        todo_issues = [iss for iss in issues if iss["fields"]["status"]["name"] in ("To Do", "Ready")]
+        total_pts = sum((iss["fields"].get(STORY_POINTS_FIELD) or 0) for iss in todo_issues)
+
+        if total_pts <= MAX_SPRINT_POINTS:
+            continue
+
+        log.info(f"  Sprint '{sname}' has {total_pts:.0f}/{MAX_SPRINT_POINTS} SP — rebalancing.")
+
+        # Sort by roadmap priority: highest priority first, so we remove from the end (lowest priority)
+        todo_issues.sort(key=lambda iss: _roadmap_sort_key(iss))
+
+        # Remove lowest-priority tickets until under cap
+        overflow = []
+        while total_pts > MAX_SPRINT_POINTS and todo_issues:
+            victim = todo_issues.pop()  # lowest priority (end of sorted list)
+            pts = (victim["fields"].get(STORY_POINTS_FIELD) or 0)
+            overflow.append(victim)
+            total_pts -= pts
+            log.info(f"    Bumping {victim['key']} ({pts}pts) from '{sname}'")
+
+        if not overflow:
+            continue
+
+        # Move overflow to next future sprint (if exists), else leave in backlog
+        if i + 1 < len(future_sprints):
+            next_sprint = future_sprints[i + 1]
+            next_sid, next_name = next_sprint["id"], next_sprint["name"]
+            for iss in overflow:
+                if move_issue_to_sprint(iss["key"], next_sid):
+                    log.info(f"    {iss['key']} → '{next_name}'")
+        else:
+            # No next sprint — move to backlog by removing from sprint
+            for iss in overflow:
+                try:
+                    ok, resp = jira_put(f"/rest/api/3/issue/{iss['key']}", {
+                        "fields": {"customfield_10020": None}  # Clear sprint
+                    })
+                    # Agile API approach: move to backlog
+                    jira_post(f"/rest/agile/1.0/backlog/issue", {"issues": [iss["key"]]})
+                    log.info(f"    {iss['key']} → backlog (no more future sprints)")
+                except Exception as e:
+                    log.warning(f"    Failed to move {iss['key']} to backlog: {e}")
+
+    log.info("JOB 16: Rebalance complete.")
+
+
+def sync_roadmap_to_sprints(future_sprints):
+    """After rebalancing, update AR idea roadmap columns to match where delivery epics actually landed."""
+    if not ROADMAP_COLUMNS or not future_sprints:
+        return
+    log.info("JOB 16: Syncing roadmap columns to sprint assignments...")
+
+    # Build sprint_id → column_name mapping
+    sprint_to_column = {}
+    for col in ROADMAP_COLUMNS:
+        matched = find_sprint_for_column(col["value"], future_sprints)
+        if matched:
+            sprint_to_column[str(matched["id"])] = col
+
+    # For each epic in EPIC_ROADMAP_RANK, check where its children actually are
+    for epic_key, (col_rank, vote) in list(EPIC_ROADMAP_RANK.items()):
+        try:
+            data = jira_get("/rest/api/3/search/jql", params={
+                "jql": f'project = AX AND parent = {epic_key} AND status not in (Done, Released)',
+                "fields": "sprint", "maxResults": 1
+            })
+            children = data.get("issues", [])
+            if not children:
+                continue
+
+            # Use the sprint of the first child as the canonical sprint
+            child_sprint = children[0]["fields"].get("sprint")
+            if not child_sprint or not child_sprint.get("id"):
+                continue
+
+            actual_col = sprint_to_column.get(str(child_sprint["id"]))
+            if not actual_col:
+                continue
+
+            actual_rank = COLUMN_RANK.get(actual_col["id"], 999)
+            if actual_rank == col_rank:
+                continue  # Already aligned
+
+            # Find the AR idea linked to this epic
+            epic_data = jira_get("/rest/api/3/search/jql", params={
+                "jql": f'key = {epic_key}', "fields": "issuelinks", "maxResults": 1
+            })
+            epic_issues = epic_data.get("issues", [])
+            if not epic_issues:
+                continue
+
+            idea_key = None
+            for link in (epic_issues[0]["fields"].get("issuelinks") or []):
+                for direction in ("outwardIssue", "inwardIssue"):
+                    linked = link.get(direction)
+                    if linked and linked.get("key", "").startswith("AR-"):
+                        idea_key = linked["key"]
+                        break
+                if idea_key:
+                    break
+
+            if not idea_key:
+                continue
+
+            # Update idea's roadmap column
+            ok, resp = jira_put(f"/rest/api/3/issue/{idea_key}", {
+                "fields": {ROADMAP_FIELD: {"id": actual_col["id"]}}
+            })
+            if ok:
+                log.info(f"    {idea_key} roadmap → {actual_col['value']} (aligned with {epic_key} sprint)")
+                EPIC_ROADMAP_RANK[epic_key] = (actual_rank, vote)
+        except Exception as e:
+            log.warning(f"    Failed to sync roadmap for {epic_key}: {e}")
 
 
 def _roadmap_sort_key(issue):
@@ -958,10 +1082,20 @@ Verify all split tickets pass their individual test plans.
 
             update_issue_fields(key, summary=f"[SPLIT] {polished_summary}", description_md=split_desc,
                 story_points=0 if issue_type != "Epic" else None, reviewed_value="Yes")
+            # Transition split ticket to Ready
+            current_status = f.get("status", {}).get("name", "")
+            if current_status == "To Do":
+                transition_to_ready(key)
         else:
             reviewed = assess_completeness(issue_type, enrichment, new_sp)
             update_issue_fields(key, summary=polished_summary, description_md=new_desc,
                 story_points=new_sp, reviewed_value=reviewed)
+            # Transition to Ready when fully enriched
+            if reviewed == "Yes":
+                current_status = f.get("status", {}).get("name", "")
+                if current_status == "To Do":
+                    transition_to_ready(key)
+                    log.info(f"  {key} → Ready (fully enriched)")
 
         log.info(f"  Completed {key}.")
 
@@ -3862,6 +3996,12 @@ def run():
                         avail -= pts
                         log.info(f"Moved {key} ({pts}pts) [{pri}] to '{sname}'. {avail}pts left.")
                     idx += 1
+
+        log.info("JOB 16: Sprint Rebalance & Roadmap Sync")
+        future_sprints = get_future_sprints()  # Refresh after JOB 15 and JOB 2
+        future_sprints.sort(key=lambda s: s.get("startDate", ""))
+        rebalance_sprints(future_sprints)
+        sync_roadmap_to_sprints(get_active_sprint() + future_sprints)
 
         log.info("JOB 3: Rank All Sprints")
         for sprint in future_sprints:
