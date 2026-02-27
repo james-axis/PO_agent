@@ -474,6 +474,111 @@ def rank_issues(issues, label):
         if not ok:
             log.warning(f"Failed ranking {keys[idx]}: {r.status_code}")
 
+
+# ── JOB 17: Organise Roadmap Ideas by Initiative Lifecycle ───────────────────
+
+# IDs for stage/scope initiative tags (not modules)
+_LIFECYCLE_IDS = {
+    INITIATIVE_OPTIONS.get("workflows", ""): 0,   # Workflows first
+    INITIATIVE_OPTIONS.get("modules", ""): 1,      # Modules second
+    INITIATIVE_OPTIONS.get("mvp", ""): 2,          # MVP third
+    INITIATIVE_OPTIONS.get("iteration", ""): 3,    # Iteration fourth
+    INITIATIVE_OPTIONS.get("features", ""): 4,     # Features last
+}
+_STAGE_SCOPE_IDS = set(_LIFECYCLE_IDS.keys()) - {""}
+# Reverse lookup: option_id → display name
+_INITIATIVE_ID_TO_NAME = {v: k for k, v in INITIATIVE_OPTIONS.items()}
+
+
+def _idea_sort_key(idea):
+    """Sort key for ideas within a roadmap column: group by module name → lifecycle order."""
+    initiatives = idea["fields"].get(INITIATIVE_FIELD) or []
+    init_ids = [i.get("id") for i in initiatives if isinstance(i, dict)]
+
+    # Separate module from stage/scope
+    module_name = ""
+    lifecycle_rank = 99  # Default: untagged ideas go last
+
+    for iid in init_ids:
+        if iid in _STAGE_SCOPE_IDS:
+            lifecycle_rank = min(lifecycle_rank, _LIFECYCLE_IDS.get(iid, 99))
+        else:
+            # This is the module name
+            name = _INITIATIVE_ID_TO_NAME.get(iid, "")
+            if name and name not in ("voa",):
+                module_name = name
+
+    return (module_name or "zzz", lifecycle_rank)
+
+
+def organise_roadmap_ideas():
+    """JOB 17: Organise ideas within each roadmap column by initiative module grouping and lifecycle order.
+    Groups same-module ideas together, ordered: Workflows → Modules → MVP → Iteration → Features."""
+    log.info("JOB 17: Organising roadmap ideas by initiative lifecycle...")
+
+    if not ROADMAP_COLUMNS:
+        log.info("  JOB 17: No roadmap columns — skipping.")
+        return
+
+    # Fetch ALL AR ideas (both swimlanes) with initiative data
+    jql = f'project = {AR_PROJECT_KEY} AND status != Done'
+    fields = f"summary,{INITIATIVE_FIELD},{SWIMLANE_FIELD},{ROADMAP_FIELD}"
+    all_ideas, start_at = [], 0
+    while True:
+        data = jira_get("/rest/api/3/search/jql", params={
+            "jql": jql, "fields": fields, "maxResults": 100, "startAt": start_at
+        })
+        batch = data.get("issues", [])
+        total = data.get("total", 0)
+        all_ideas.extend(batch)
+        if start_at + len(batch) >= total:
+            break
+        start_at += len(batch)
+
+    if not all_ideas:
+        log.info("  JOB 17: No ideas found.")
+        return
+
+    # Group ideas by roadmap column ID
+    col_lookup = {col["id"]: col["value"] for col in ROADMAP_COLUMNS}
+    if ROADMAP_BACKLOG_ID:
+        col_lookup[ROADMAP_BACKLOG_ID] = "Backlog"
+
+    ideas_by_col = {}
+    for idea in all_ideas:
+        col_id = (idea["fields"].get(ROADMAP_FIELD) or {}).get("id")
+        if col_id and col_id in col_lookup:
+            ideas_by_col.setdefault(col_id, []).append(idea)
+
+    total_ranked = 0
+    for col_id, ideas in ideas_by_col.items():
+        col_name = col_lookup[col_id]
+        if len(ideas) < 2:
+            continue
+
+        # Sort by module grouping → lifecycle order
+        ideas.sort(key=_idea_sort_key)
+        keys = [i["key"] for i in ideas]
+
+        # Apply ranking via agile API
+        for idx in range(len(keys) - 2, -1, -1):
+            ok, r = jira_put("/rest/agile/1.0/issue/rank", {
+                "issues": [keys[idx]], "rankBeforeIssue": keys[idx + 1]
+            })
+            if not ok:
+                log.warning(f"  JOB 17: Failed ranking {keys[idx]} in {col_name}: {r.status_code}")
+
+        # Log grouping for this column
+        groups = {}
+        for idea in ideas:
+            mod, lc = _idea_sort_key(idea)
+            groups.setdefault(mod, []).append(idea["key"])
+        group_summary = ", ".join(f"{m.title()}({len(v)})" for m, v in groups.items())
+        log.info(f"  {col_name}: {len(ideas)} ideas ranked — {group_summary}")
+        total_ranked += len(ideas)
+
+    log.info(f"JOB 17: Organised {total_ranked} ideas across {len(ideas_by_col)} columns.")
+
 def next_tuesday(dt):
     days = (1 - dt.weekday()) % 7
     return dt + timedelta(days=days if days else 7)
@@ -4019,6 +4124,9 @@ def run():
         log.info("JOB 13: Micro-Decomposition")
         micro_decompose_tickets()
 
+        log.info("JOB 17: Organise Roadmap Ideas")
+        organise_roadmap_ideas()
+
         # JOB 14 runs on its own Friday schedule, not in the core loop
 
         log.info("=== Run complete ===")
@@ -4038,6 +4146,22 @@ if __name__ == "__main__":
         trigger=CronTrigger(day_of_week="mon-fri", hour="7-17", minute="0,30", timezone=sydney_tz),
         id="core_loop",
         name="Core 30-min loop (7am-5:30pm)",
+    )
+
+    # After-hours: every 2 hours on weekday evenings/nights
+    scheduler.add_job(
+        run,
+        trigger=CronTrigger(day_of_week="mon-fri", hour="0,2,4,6,18,20,22", minute=0, timezone=sydney_tz),
+        id="after_hours_weekday",
+        name="After-hours weekday (every 2hrs)",
+    )
+
+    # Weekends: every 2 hours all day
+    scheduler.add_job(
+        run,
+        trigger=CronTrigger(day_of_week="sat,sun", hour="0,2,4,6,8,10,12,14,16,18,20,22", minute=0, timezone=sydney_tz),
+        id="after_hours_weekend",
+        name="Weekend loop (every 2hrs)",
     )
 
     # Morning briefing — 7:30am Mon-Fri
@@ -4064,7 +4188,7 @@ if __name__ == "__main__":
         name="Product Weekly (Friday 7am)",
     )
 
-    log.info("Scheduler started — core loop every 30min (7am-6pm), briefing 7:30am, EOD 5:30pm, Product Weekly Fri 7am AEDT.")
+    log.info("Scheduler started — core loop every 30min (7am-6pm Mon-Fri), after-hours every 2hrs, weekends every 2hrs. Briefing 7:30am, EOD 5:30pm, Product Weekly Fri 7am AEDT.")
     discover_reviewed_field()
     discover_delivery_link_type()
     sync_roadmap_columns()
