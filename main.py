@@ -2733,6 +2733,407 @@ def micro_decompose_tickets():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# JOB 15: Strategic Pipeline — AR Ideas → Roadmap → Delivery Epics → Sprints
+# ══════════════════════════════════════════════════════════════════════════════
+
+DELIVERY_LINK_TYPE_ID = None  # Auto-discovered at startup
+
+
+def discover_delivery_link_type():
+    """Find the issue link type for JPD Delivery links."""
+    global DELIVERY_LINK_TYPE_ID
+    try:
+        data = jira_get("/rest/api/3/issueLinkType")
+        for lt in data.get("issueLinkTypes", []):
+            if lt["name"].lower() in ("delivery", "delivers"):
+                DELIVERY_LINK_TYPE_ID = lt["id"]
+                log.info(f"Discovered Delivery link type: id={DELIVERY_LINK_TYPE_ID} ({lt['name']})")
+                return
+        # Fallback: use "Relates" if Delivery not found
+        for lt in data.get("issueLinkTypes", []):
+            if lt["name"].lower() == "relates":
+                DELIVERY_LINK_TYPE_ID = lt["id"]
+                log.info(f"No 'Delivery' link type found — using 'Relates' (id={DELIVERY_LINK_TYPE_ID})")
+                return
+        log.warning("No suitable link type found for strategic pipeline delivery links.")
+    except Exception as e:
+        log.error(f"Failed to discover delivery link type: {e}")
+
+
+def get_strategic_ideas_scored():
+    """Fetch all Strategic Initiatives ideas that have all 4 RICE scores."""
+    jql = (
+        f'project = {AR_PROJECT_KEY} AND cf[10694] = "Strategic Initiatives"'
+        f' AND cf[10526] is not EMPTY AND cf[10047] is not EMPTY'
+        f' AND cf[10527] is not EMPTY AND cf[10058] is not EMPTY'
+    )
+    fields = (
+        f"summary,description,status,priority,issuelinks,"
+        f"{RICE_REACH_FIELD},{RICE_IMPACT_FIELD},{RICE_CONFIDENCE_FIELD},"
+        f"{RICE_EFFORT_FIELD},{ROADMAP_FIELD},{SWIMLANE_FIELD}"
+    )
+    issues, start_at = [], 0
+    while True:
+        data = jira_get("/rest/api/3/search/jql", params={
+            "jql": jql, "fields": fields, "maxResults": 100, "startAt": start_at
+        })
+        batch = data.get("issues", [])
+        total = data.get("total", 0)
+        issues.extend(batch)
+        if start_at + len(batch) >= total:
+            break
+        start_at += len(batch)
+    return issues
+
+
+def prioritise_strategic_ideas(issues):
+    """Re-prioritise scored Strategic Initiatives ideas across Roadmap columns by RICE value."""
+    if not issues:
+        log.info("  JOB 15: No scored Strategic Initiatives ideas to prioritise.")
+        return
+
+    for issue in issues:
+        f = issue["fields"]
+        r = f.get(RICE_REACH_FIELD) or 1
+        i = f.get(RICE_IMPACT_FIELD) or 1
+        c = f.get(RICE_CONFIDENCE_FIELD) or 1
+        e = f.get(RICE_EFFORT_FIELD) or 1
+        issue["_rice_value"] = (r * i * c) / e
+    issues.sort(key=lambda x: x["_rice_value"], reverse=True)
+
+    log.info(f"  JOB 15: Prioritising {len(issues)} Strategic Initiatives ideas across roadmap columns.")
+
+    idx = 0
+    for col in ROADMAP_COLUMNS:
+        if idx >= len(issues):
+            break
+        slots = IDEAS_PER_COLUMN
+        assigned = 0
+        while idx < len(issues) and assigned < slots:
+            issue = issues[idx]
+            current_roadmap = (issue["fields"].get(ROADMAP_FIELD) or {}).get("id")
+            target_id = col["id"]
+            if current_roadmap != target_id:
+                ok, resp = jira_put(f"/rest/api/3/issue/{issue['key']}", {
+                    "fields": {ROADMAP_FIELD: {"id": target_id}}
+                })
+                if ok:
+                    log.info(f"    {issue['key']} (RICE={issue['_rice_value']:.1f}) → {col['value']}")
+                else:
+                    log.warning(f"    Failed to move {issue['key']} to {col['value']}: {resp.status_code}")
+            else:
+                log.info(f"    {issue['key']} (RICE={issue['_rice_value']:.1f}) already in {col['value']}")
+            idx += 1
+            assigned += 1
+
+    while idx < len(issues):
+        issue = issues[idx]
+        current_roadmap = (issue["fields"].get(ROADMAP_FIELD) or {}).get("id")
+        if current_roadmap != ROADMAP_BACKLOG_ID:
+            ok, resp = jira_put(f"/rest/api/3/issue/{issue['key']}", {
+                "fields": {ROADMAP_FIELD: {"id": ROADMAP_BACKLOG_ID}}
+            })
+            if ok:
+                log.info(f"    {issue['key']} (RICE={issue['_rice_value']:.1f}) → Backlog")
+        idx += 1
+
+
+def get_idea_delivery_epic(idea_links):
+    """Check if an AR idea already has a linked AX delivery Epic. Returns the epic key or None."""
+    for link in (idea_links or []):
+        for direction in ("outwardIssue", "inwardIssue"):
+            linked = link.get(direction)
+            if not linked:
+                continue
+            linked_key = linked.get("key", "")
+            linked_type = linked.get("fields", {}).get("issuetype", {}).get("name", "")
+            if linked_key.startswith("AX-") and linked_type == "Epic":
+                return linked_key
+    return None
+
+
+def build_delivery_epic_prompt(idea):
+    """Build Claude prompt to generate an AX delivery Epic + child tickets from an AR idea."""
+    f = idea["fields"]
+    summary = f.get("summary", "")
+    desc = f.get("description") or ""
+    if isinstance(desc, dict):
+        desc = adf_to_text(desc)
+
+    rice_r = f.get(RICE_REACH_FIELD) or "?"
+    rice_i = f.get(RICE_IMPACT_FIELD) or "?"
+    rice_c = f.get(RICE_CONFIDENCE_FIELD) or "?"
+    rice_e = f.get(RICE_EFFORT_FIELD) or "?"
+
+    return f"""You are a senior Product Manager for Axis CRM, a life insurance distribution CRM platform.
+The platform is used by AFSL-licensed insurance advisers to manage clients, policies, applications, quotes, payments and commissions.
+Partner insurers include TAL, Zurich, AIA, MLC Life, MetLife, Resolution Life, Integrity Life and others.
+The CRM serves multiple divisions: LIP (lead intake & processing) team, services team, and advisers.
+
+You are creating a delivery Epic in the AX (Sprints) project from a strategic initiative idea.
+
+SOURCE IDEA: {idea["key"]}
+SUMMARY: {summary}
+RICE: Reach={rice_r}, Impact={rice_i}, Confidence={rice_c}, Effort={rice_e}
+DESCRIPTION:
+{desc[:4000]}
+
+Create a delivery Epic and break it into shippable tickets.
+
+Respond with ONLY a JSON object (no markdown, no backticks):
+
+{{
+  "epic": {{
+    "summary": "Implementation-focused epic title (different from idea title)",
+    "description_summary": "One paragraph: what will be built and expected outcome",
+    "priority": "Medium"
+  }},
+  "tickets": [
+    {{
+      "type": "Task",
+      "summary": "Clear task summary",
+      "priority": "Medium",
+      "story_points": 2,
+      "user_story": "As a [user], I want [goal] so that [benefit]",
+      "acceptance_criteria": ["Criterion 1", "Criterion 2"],
+      "test_plan": ["Test step 1", "Test step 2"]
+    }},
+    {{
+      "type": "Spike",
+      "summary": "Investigation: [what]",
+      "priority": "High",
+      "story_points": 1,
+      "investigation_summary": "What to investigate"
+    }}
+  ]
+}}
+
+RULES:
+- At least 2 tickets under the epic.
+- Epic summary must be implementation-focused, NOT a copy of the idea title.
+- Types: Task, Bug, Spike, Support, Maintenance.
+- Tasks MUST include user_story, acceptance_criteria (array), test_plan (array).
+- Bug/Spike/Support need summary + investigation_summary. Maintenance just summary.
+- Max 3 story points per ticket (3=6hrs, 2=4hrs, 1=2hrs, 0.5=1hr, 0.25=30min).
+- story_points: 0.25, 0.5, 1, 2, or 3.
+- Priority: Lowest, Low, Medium, High, Highest.
+- Write substantive descriptions a developer can act on."""
+
+
+def link_idea_to_epic(idea_key, epic_key):
+    """Create an issue link between AR idea and AX delivery Epic."""
+    if not DELIVERY_LINK_TYPE_ID:
+        log.warning(f"  JOB 15: No delivery link type — cannot link {idea_key} → {epic_key}")
+        return False
+    ok, resp = jira_post("/rest/api/3/issueLink", {
+        "type": {"id": DELIVERY_LINK_TYPE_ID},
+        "inwardIssue": {"key": idea_key},
+        "outwardIssue": {"key": epic_key},
+    })
+    if ok:
+        log.info(f"  JOB 15: Linked {idea_key} → {epic_key}")
+    else:
+        log.warning(f"  JOB 15: Failed to link {idea_key} → {epic_key}: {resp.status_code} {resp.text[:200]}")
+    return ok
+
+
+def parse_roadmap_column(col_value):
+    """Parse 'March (S1)' → (month_number, sprint_number). Returns (None, None) on failure."""
+    import calendar
+    m = re.match(r'(\w+)\s*\(S(\d+)\)', col_value)
+    if not m:
+        return None, None
+    month_name = m.group(1)
+    sprint_num = int(m.group(2))
+    month_map = {v: k for k, v in enumerate(calendar.month_name) if v}
+    return month_map.get(month_name), sprint_num
+
+
+def find_sprint_for_column(col_value, all_sprints):
+    """Find the sprint matching a roadmap column like 'March (S1)'. Returns sprint dict or None."""
+    month_num, sprint_num = parse_roadmap_column(col_value)
+    if not month_num:
+        return None
+    month_sprints = []
+    for sprint in all_sprints:
+        start_str = sprint.get("startDate", "")[:10]
+        if not start_str:
+            continue
+        start_date = datetime.strptime(start_str, "%Y-%m-%d")
+        if start_date.month == month_num:
+            month_sprints.append(sprint)
+    month_sprints.sort(key=lambda s: s["startDate"])
+    if sprint_num <= len(month_sprints):
+        return month_sprints[sprint_num - 1]
+    return None
+
+
+def get_column_name(roadmap_col_id):
+    """Look up column name from its ID."""
+    for col in ROADMAP_COLUMNS:
+        if col["id"] == roadmap_col_id:
+            return col["value"]
+    return None
+
+
+def process_strategic_pipeline():
+    """JOB 15: Unified strategic pipeline — AR ideas → roadmap → delivery Epics → child tickets → sprints."""
+    if not ANTHROPIC_API_KEY:
+        log.info("JOB 15 skipped — ANTHROPIC_API_KEY not set.")
+        return
+
+    # ── Step 1: Prioritise strategic ideas across roadmap columns ──
+    log.info("  JOB 15 Step 1: Prioritising Strategic Initiatives ideas...")
+    all_ideas = get_strategic_ideas_scored()
+    prioritise_strategic_ideas(all_ideas)
+
+    # Re-fetch to get updated roadmap positions (after prioritisation)
+    all_ideas = get_strategic_ideas_scored()
+
+    # ── Step 2+3: Create delivery Epics + child tickets for ideas in columns ──
+    log.info("  JOB 15 Step 2: Creating delivery Epics for roadmap-placed ideas...")
+    column_ids = {col["id"] for col in ROADMAP_COLUMNS}
+    roadmap_ideas = [
+        idea for idea in all_ideas
+        if (idea["fields"].get(ROADMAP_FIELD) or {}).get("id") in column_ids
+    ]
+    log.info(f"  JOB 15: {len(roadmap_ideas)} ideas in roadmap columns.")
+
+    all_sprints = get_active_sprint() + get_future_sprints()
+    all_sprints.sort(key=lambda s: s.get("startDate", ""))
+
+    new_epics = 0
+    for idea in roadmap_ideas:
+        idea_key = idea["key"]
+        idea_links = idea["fields"].get("issuelinks") or []
+
+        # Skip if already has a delivery Epic
+        existing_epic = get_idea_delivery_epic(idea_links)
+        if existing_epic:
+            log.info(f"    {idea_key} → already has {existing_epic}")
+            continue
+
+        log.info(f"    {idea_key}: Generating delivery Epic via Claude...")
+        prompt = build_delivery_epic_prompt(idea)
+        response = call_claude(prompt, max_tokens=4096)
+        if not response:
+            log.warning(f"    {idea_key}: Claude failed — skipping.")
+            continue
+
+        try:
+            clean = re.sub(r'^```(?:json)?\s*', '', response)
+            clean = re.sub(r'\s*```$', '', clean)
+            structured = json.loads(clean)
+        except json.JSONDecodeError as e:
+            log.warning(f"    {idea_key}: JSON parse error: {e}")
+            continue
+
+        # Build Epic description with template
+        epic_data = structured.get("epic", {})
+        f = idea["fields"]
+        rice_r = f.get(RICE_REACH_FIELD) or "?"
+        rice_i = f.get(RICE_IMPACT_FIELD) or "?"
+        rice_c = f.get(RICE_CONFIDENCE_FIELD) or "?"
+        rice_e = f.get(RICE_EFFORT_FIELD) or "?"
+        rice_line = f"{rice_r}R · {rice_i}I · {rice_c}C · {rice_e}E"
+
+        epic_desc_md = (
+            f"**Product Manager:**\n"
+            f"1. **Summary:** {epic_data.get('description_summary', '')}\n"
+            f"2. **Validated:** No\n"
+            f"3. **RICE score:** {rice_line}\n"
+            f"4. **PRD:**\n"
+            f"5. **Source idea:** [{idea_key}](https://axiscrm.atlassian.net/browse/{idea_key})\n\n"
+            f"{DOR_DOD_EPIC}"
+        )
+
+        epic_fields = {
+            "project": {"key": "AX"},
+            "issuetype": {"name": "Epic"},
+            "summary": epic_data.get("summary", idea["fields"]["summary"]),
+            "description": {"version": 1, "type": "doc", "content": markdown_to_adf(epic_desc_md)},
+            "assignee": {"accountId": ANDREJ_ID},
+            "priority": {"name": epic_data.get("priority", "Medium")},
+        }
+
+        ok, resp = jira_post("/rest/api/3/issue", {"fields": epic_fields})
+        if not ok:
+            log.error(f"    {idea_key}: Failed to create Epic: {resp.status_code} {resp.text[:300]}")
+            continue
+
+        epic_key = resp.json().get("key", "?")
+        log.info(f"    {idea_key} → created {epic_key}")
+        transition_to_ready(epic_key)
+        link_idea_to_epic(idea_key, epic_key)
+
+        # Create child tickets
+        tickets = structured.get("tickets", [])
+        child_keys = []
+        total_pts = 0
+        for ticket in tickets:
+            ticket_type = ticket.get("type", "Task")
+            if ticket_type not in ("Task", "Bug", "Spike", "Support", "Maintenance"):
+                ticket_type = "Task"
+            child_key = create_ax_ticket(ticket, ticket_type, parent_key=epic_key)
+            if child_key:
+                transition_to_ready(child_key)
+                pts = ticket.get("story_points", 0) or 0
+                total_pts += pts
+                child_keys.append(child_key)
+
+        log.info(f"    {epic_key}: {len(child_keys)} tickets, {total_pts} SP")
+
+        # Move child tickets to sprint matching the roadmap column
+        col_id = (idea["fields"].get(ROADMAP_FIELD) or {}).get("id")
+        col_name = get_column_name(col_id)
+        if col_name:
+            target_sprint = find_sprint_for_column(col_name, all_sprints)
+            if target_sprint:
+                for ck in child_keys:
+                    move_issue_to_sprint(ck, target_sprint["id"])
+                log.info(f"    {epic_key}: tickets → sprint '{target_sprint['name']}' (column: {col_name})")
+            else:
+                log.warning(f"    No sprint found for column '{col_name}'")
+
+        new_epics += 1
+
+    # ── Step 4: Verify sprint assignments for existing delivery tickets ──
+    log.info("  JOB 15 Step 4: Verifying sprint assignments for existing delivery tickets...")
+    for idea in roadmap_ideas:
+        idea_links = idea["fields"].get("issuelinks") or []
+        existing_epic = get_idea_delivery_epic(idea_links)
+        if not existing_epic:
+            continue
+
+        col_id = (idea["fields"].get(ROADMAP_FIELD) or {}).get("id")
+        col_name = get_column_name(col_id)
+        if not col_name:
+            continue
+
+        target_sprint = find_sprint_for_column(col_name, all_sprints)
+        if not target_sprint:
+            continue
+
+        # Find child tickets not yet in a future/active sprint
+        try:
+            jql = (
+                f'project = AX AND parent = {existing_epic}'
+                f' AND (sprint is EMPTY OR sprint in closedSprints())'
+                f' AND status not in (Done, Released)'
+            )
+            data = jira_get("/rest/api/3/search/jql", params={
+                "jql": jql, "fields": "summary", "maxResults": 50
+            })
+            for issue in data.get("issues", []):
+                if move_issue_to_sprint(issue["key"], target_sprint["id"]):
+                    log.info(f"      {issue['key']} → sprint '{target_sprint['name']}' (epic {existing_epic})")
+        except Exception as e:
+            log.warning(f"    Failed to check children of {existing_epic}: {e}")
+
+    log.info(f"  JOB 15 complete. {new_epics} new delivery Epic(s) created.")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # JOB 14: Product Weekly Meeting Minutes (Confluence)
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -3271,6 +3672,9 @@ def run():
         future_sprints = get_future_sprints()
         future_sprints = ensure_sprint_runway(future_sprints, required=8)
 
+        log.info("JOB 15: Strategic Pipeline")
+        process_strategic_pipeline()
+
         log.info("JOB 2: Move Backlog to Sprints")
         backlog = get_andrej_ready_backlog()
         if not backlog:
@@ -3371,6 +3775,7 @@ if __name__ == "__main__":
 
     log.info("Scheduler started — core loop every 30min (7am-6pm), briefing 7:30am, EOD 5:30pm, Product Weekly Fri 7am AEDT.")
     discover_reviewed_field()
+    discover_delivery_link_type()
 
     # Start Telegram bot in a daemon thread (runs alongside scheduler)
     if TELEGRAM_BOT_TOKEN:
