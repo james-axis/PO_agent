@@ -29,7 +29,7 @@ REVIEWED_FIELD     = None  # Auto-discovered at startup
 
 # ── AR (Strategic Roadmap / JPD) Config ───────────────────────────────────────
 AR_PROJECT_KEY     = "AR"
-VOTE_FIELD         = "customfield_10695"   # Vote rating (0-5) for prioritisation
+VOTE_FIELD         = "customfield_10834"   # Vote rating (0-5) for prioritisation
 ROADMAP_FIELD      = "customfield_10560"
 SWIMLANE_FIELD     = "customfield_10694"
 ADVISER_FIELD      = "customfield_10696"
@@ -132,14 +132,44 @@ def sync_roadmap_columns():
     today = datetime.now()
     cur_month, cur_year = today.month, today.year
 
-    # Generate the 12 column names we need (current month + 5 months ahead)
+    # Determine the active sprint to figure out which half of the month we're in
+    # Default to S1 if no active sprint found
+    active_sprint_num = 1
+    try:
+        active_sprints = jira_get(f"/rest/agile/1.0/board/{BOARD_ID}/sprint?state=active").get("values", [])
+        if active_sprints:
+            # Count how many sprints in the current month started before/at the active one
+            active_start = active_sprints[0].get("startDate", "")[:10]
+            if active_start:
+                active_date = datetime.strptime(active_start, "%Y-%m-%d")
+                cur_month, cur_year = active_date.month, active_date.year
+                # Find all sprints in this month to determine S1 vs S2
+                all_sprints = jira_get(f"/rest/agile/1.0/board/{BOARD_ID}/sprint?state=active,future,closed").get("values", [])
+                month_sprints = sorted([
+                    s for s in all_sprints
+                    if s.get("startDate", "")[:7] == active_start[:7]
+                ], key=lambda s: s["startDate"])
+                for i, s in enumerate(month_sprints):
+                    if s["id"] == active_sprints[0]["id"]:
+                        active_sprint_num = i + 1
+                        break
+    except Exception as e:
+        log.warning(f"Could not determine active sprint position: {e}")
+
+    # Generate 12 column names starting from the active sprint
     needed_names = []
-    for i in range(6):
-        m = (cur_month + i - 1) % 12 + 1
-        y = cur_year + (cur_month + i - 1) // 12
+    start_month, start_year, start_sprint = cur_month, cur_year, active_sprint_num
+    m, y, s = start_month, start_year, start_sprint
+    while len(needed_names) < 12:
         month_name = calendar.month_name[m]
-        needed_names.append(f"{month_name} (S1)")
-        needed_names.append(f"{month_name} (S2)")
+        needed_names.append(f"{month_name} (S{s})")
+        s += 1
+        if s > 2:
+            s = 1
+            m += 1
+            if m > 12:
+                m = 1
+                y += 1
 
     log.info(f"Roadmap columns needed: {needed_names[0]} → {needed_names[-1]}")
 
@@ -1108,9 +1138,9 @@ def get_user_feedback_ideas(scored_only=False):
     """Fetch AR ideas in the 'User Feedback' swimlane."""
     jql = f'project = {AR_PROJECT_KEY} AND cf[10694] = "User Feedback" AND status != Done'
     if scored_only:
-        jql += f' AND cf[10695] is not EMPTY'
+        jql += f' AND cf[10834] is not EMPTY'
     else:
-        jql += f' AND cf[10695] is EMPTY'
+        jql += f' AND cf[10834] is EMPTY'
     fields = f"summary,description,status,priority,labels,{VOTE_FIELD},{ROADMAP_FIELD},{SWIMLANE_FIELD},{ADVISER_FIELD}"
     issues, start_at = [], 0
     while True:
