@@ -3136,7 +3136,7 @@ def process_strategic_pipeline():
     ]
     log.info(f"  JOB 15: {len(roadmap_ideas)} ideas in roadmap columns.")
 
-    all_sprints = get_active_sprint() + get_future_sprints()
+    all_sprints = get_future_sprints()
     all_sprints.sort(key=lambda s: s.get("startDate", ""))
 
     new_epics = 0
@@ -3223,17 +3223,27 @@ def process_strategic_pipeline():
 
         log.info(f"    {epic_key}: {len(child_keys)} tickets, {total_pts} SP")
 
-        # Move child tickets to sprint matching the roadmap column
+        # Move child tickets to sprint matching the roadmap column (respecting SP cap)
         col_id = (idea["fields"].get(ROADMAP_FIELD) or {}).get("id")
         col_name = get_column_name(col_id)
         if col_name:
             target_sprint = find_sprint_for_column(col_name, all_sprints)
             if target_sprint:
-                for ck in child_keys:
-                    move_issue_to_sprint(ck, target_sprint["id"])
-                log.info(f"    {epic_key}: tickets → sprint '{target_sprint['name']}' (column: {col_name})")
+                sid = target_sprint["id"]
+                avail = MAX_SPRINT_POINTS - get_sprint_todo_points(sid)
+                moved, skipped = 0, 0
+                for i, ck in enumerate(child_keys):
+                    pts = tickets[i].get("story_points", 0) or 0
+                    if pts > avail:
+                        skipped += 1
+                        log.info(f"      {ck} ({pts}pts) — sprint full, leaving in backlog")
+                        continue
+                    if move_issue_to_sprint(ck, sid):
+                        avail -= pts
+                        moved += 1
+                log.info(f"    {epic_key}: {moved} tickets → sprint '{target_sprint['name']}' ({skipped} skipped, cap)")
             else:
-                log.warning(f"    No sprint found for column '{col_name}'")
+                log.warning(f"    No future sprint found for column '{col_name}'")
 
         new_epics += 1
 
@@ -3254,19 +3264,30 @@ def process_strategic_pipeline():
         if not target_sprint:
             continue
 
-        # Find child tickets not yet in a future/active sprint
+        sid = target_sprint["id"]
+        avail = MAX_SPRINT_POINTS - get_sprint_todo_points(sid)
+        if avail <= 0:
+            log.info(f"    Sprint '{target_sprint['name']}' full — skipping {existing_epic} children")
+            continue
+
+        # Find child tickets in Ready status, not yet in a future sprint
         try:
             jql = (
                 f'project = AX AND parent = {existing_epic}'
                 f' AND (sprint is EMPTY OR sprint in closedSprints())'
-                f' AND status not in (Done, Released)'
+                f' AND status = Ready'
             )
             data = jira_get("/rest/api/3/search/jql", params={
-                "jql": jql, "fields": "summary", "maxResults": 50
+                "jql": jql, "fields": f"summary,{STORY_POINTS_FIELD}", "maxResults": 50
             })
             for issue in data.get("issues", []):
-                if move_issue_to_sprint(issue["key"], target_sprint["id"]):
-                    log.info(f"      {issue['key']} → sprint '{target_sprint['name']}' (epic {existing_epic})")
+                pts = (issue["fields"].get(STORY_POINTS_FIELD) or 0)
+                if pts > avail:
+                    log.info(f"      {issue['key']} ({pts}pts) — sprint full, leaving in backlog")
+                    continue
+                if move_issue_to_sprint(issue["key"], sid):
+                    avail -= pts
+                    log.info(f"      {issue['key']} ({pts}pts) → sprint '{target_sprint['name']}' (epic {existing_epic})")
         except Exception as e:
             log.warning(f"    Failed to check children of {existing_epic}: {e}")
 
