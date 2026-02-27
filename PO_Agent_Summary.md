@@ -4,7 +4,7 @@
 
 A Python automation agent that runs the operational side of Product Ownership for the AX (Sprints) and AR (Strategic Roadmap) Jira projects. It manages sprint planning, ticket quality, board hygiene, meeting prep, and daily comms — all autonomously.
 
-The core philosophy is simple: **the roadmap is the single source of truth**. You manually prioritise ideas in roadmap columns, and the agent syncs everything downstream — delivery epics, sprint assignments, capacity enforcement, and feedback alignment.
+The core philosophy is simple: **the roadmap is the single source of truth**. You manually prioritise ideas in roadmap columns, and the agent syncs everything downstream — delivery epics, sprint assignments, capacity enforcement, feedback alignment, and visual organisation.
 
 ---
 
@@ -19,6 +19,7 @@ roadmap columns          ───►         Loads tickets into matching sprint
                                       If over capacity → bumps tickets to next sprint
                                       AND slides the idea to the next roadmap column
                                       Aligns feedback ideas to matching SI + column
+                                      Organises ideas within columns by initiative
 ```
 
 ### Ticket Lifecycle
@@ -64,6 +65,14 @@ User Feedback ideas are automatically matched to their parent Strategic Initiati
 - The feedback idea is moved to the same roadmap column as the matched SI
 - This keeps both swimlanes visually aligned on the roadmap board
 
+### Roadmap Visual Organisation (JOB 17)
+
+Within each roadmap column, ideas are automatically sorted to create a structured visual flow:
+1. **Grouped by initiative module** — all "Compliance Module" ideas together, all "Quoting Feature" together, etc.
+2. **Ordered by lifecycle within each group** — Workflows → Modules → MVP → Iteration → Features
+
+This means on the roadmap board, you see clean visual clusters of related work flowing through their natural lifecycle, rather than scattered ideas.
+
 ---
 
 ## Jobs
@@ -86,9 +95,10 @@ User Feedback ideas are automatically matched to their parent Strategic Initiati
 | 13 | Micro-Decomposition | Splits tickets ≥2 SP into 0.5–1 SP standalone tickets for smoother burndown, archives original to ARU |
 | 14 | Product Weekly | Duplicates last week's Confluence page, injects Claude-generated sprint summary and health indicator, carries over TODO action items. Runs Fridays 7am |
 | 15 | Strategic Pipeline | Reads manually-placed roadmap positions, creates delivery Epics with Claude-generated breakdown, links AR idea ↔ AX Epic, loads child tickets into matching future sprint (respecting 40 SP cap). Never touches the active sprint |
-| 16 | Sprint Rebalance & Roadmap Sync | Enforces 40 SP cap across all future sprints. Bumps lowest-priority overflow tickets to the next sprint. Then syncs AR idea roadmap columns to match actual epic sprint placement |
+| 16 | Sprint Rebalance & Roadmap Sync | Enforces 40 SP cap across all future sprints. Bumps lowest-priority overflow tickets to the next sprint. Syncs AR idea roadmap columns to match actual epic sprint placement |
+| 17 | Roadmap Organisation | Sorts ideas within each roadmap column by initiative module grouping, then by lifecycle order: Workflows → Modules → MVP → Iteration → Features |
 
-### Execution Order (every 30 minutes, 7am–5:30pm Mon–Fri AEDT)
+### Execution Order (core loop)
 
 ```
 JOB 0  Sprint Lifecycle
@@ -103,9 +113,20 @@ JOB 6  User Feedback (clean + align to SI)
 JOB 11 Board Monitor
 JOB 12 Archive Old Backlog
 JOB 13 Micro-Decomposition
+JOB 17 Organise Roadmap Ideas
 ```
 
 Separate schedules: JOB 9 (7:30am), JOB 10 (5:30pm), JOB 14 (Fridays 7am).
+
+### Schedule
+
+| Window | Frequency | Days |
+|--------|-----------|------|
+| **7:00am – 5:30pm** | Every 30 minutes | Mon – Fri |
+| **6:00pm – 6:00am** | Every 2 hours | Mon – Fri |
+| **All day** | Every 2 hours | Sat – Sun |
+
+Morning briefing at 7:30am, EOD summary at 5:30pm, Product Weekly Fridays 7am. All times AEDT (Sydney).
 
 ---
 
@@ -137,7 +158,7 @@ If capacity forces a ticket out of its target sprint, the agent cascades it to t
 
 ## Technical Setup
 
-**Runtime:** Single `main.py` (~4,000 lines), deployed on Railway with auto-deploy from GitHub.
+**Runtime:** Single `main.py` (~4,200 lines), deployed on Railway with auto-deploy from GitHub.
 
 **Stack:**
 - Python 3 + APScheduler (cron-based scheduling, Sydney timezone)
@@ -168,6 +189,7 @@ If capacity forces a ticket out of its target sprint, the agent cascades it to t
 - Pagination handling across all Jira queries
 - Three-state review system: empty → "Partially" → "Yes" (Yes = Ready transition)
 - AI content matching for feedback → SI alignment
+- Initiative lifecycle sorting (Workflows → Modules → MVP → Iteration → Features)
 - Graceful degradation (AI jobs skip if no API key, Telegram skips if no token)
 
 **Repository:** [github.com/james-axis/PO_agent](https://github.com/james-axis/PO_agent)
