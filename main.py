@@ -29,40 +29,31 @@ REVIEWED_FIELD     = None  # Auto-discovered at startup
 
 # ── AR (Strategic Roadmap / JPD) Config ───────────────────────────────────────
 AR_PROJECT_KEY     = "AR"
-RICE_REACH_FIELD   = "customfield_10526"
-RICE_IMPACT_FIELD  = "customfield_10047"
-RICE_CONFIDENCE_FIELD = "customfield_10527"
-RICE_EFFORT_FIELD  = "customfield_10058"
-RICE_VALUE_FIELD   = "customfield_10195"   # Formula: auto-computed by JPD
+VALUE_FIELD        = "customfield_10834"   # Value rating (1-5) for prioritisation
 ROADMAP_FIELD      = "customfield_10560"
 SWIMLANE_FIELD     = "customfield_10694"
 ADVISER_FIELD      = "customfield_10696"
 USER_FEEDBACK_OPTION_ID = "10575"
 
-# Roadmap column option IDs, ordered left-to-right (highest priority first)
-ROADMAP_COLUMNS = [
-    {"value": "February (S2)", "id": "10232"},
-    {"value": "March (S1)",    "id": "10233"},
-    {"value": "March (S2)",    "id": "10269"},
-    {"value": "April (S1)",    "id": "10529"},
-    {"value": "April (S2)",    "id": "10530"},
-    {"value": "May (S1)",      "id": "10531"},
-    {"value": "May (S2)",      "id": "10538"},
-    {"value": "June (S1)",     "id": "10539"},
-    {"value": "June (S2)",     "id": "10540"},
-    {"value": "July (S1)",     "id": "10537"},
-    {"value": "July (S2)",     "id": "10541"},
-]
+# Known roadmap option IDs (seed values — sync_roadmap_columns() discovers more at startup)
+KNOWN_ROADMAP_OPTIONS = {
+    "February (S2)": "10232", "March (S1)": "10233", "March (S2)": "10269",
+    "April (S1)": "10529", "April (S2)": "10530", "May (S1)": "10531",
+    "May (S2)": "10538", "June (S1)": "10539", "June (S2)": "10540",
+    "July (S1)": "10537", "July (S2)": "10541",
+    "Backlog": "10536", "Shipped": "10234", "Done": "10532",
+}
 ROADMAP_BACKLOG_ID = "10536"
 ROADMAP_SHIPPED_ID = "10234"
 ROADMAP_DONE_ID    = "10532"
-IDEAS_PER_COLUMN   = 3  # Max ideas per roadmap column (2-3 for first, 3 for rest)
+IDEAS_PER_COLUMN   = 4  # Target ideas per roadmap column
 
-# Column index → priority rank (0 = highest priority, i.e. soonest sprint)
-COLUMN_RANK = {col["id"]: idx for idx, col in enumerate(ROADMAP_COLUMNS)}
-COLUMN_RANK[ROADMAP_BACKLOG_ID] = 999  # Backlog = lowest
+# These globals are populated by sync_roadmap_columns() at startup
+ROADMAP_COLUMNS = []   # Ordered list of {"value": "March (S1)", "id": "10233"} (12 columns)
+COLUMN_RANK = {}       # Column option ID → priority index (0 = soonest)
+ROADMAP_COLUMN_LOOKUP = {}  # lower(name) → option ID
 
-# Populated by JOB 15: maps AX Epic key → (column_rank, rice_value)
+# Populated by JOB 15: maps AX Epic key → (column_rank, value_rating)
 # Used by JOB 3/4 to rank tickets by strategic priority
 EPIC_ROADMAP_RANK = {}
 
@@ -111,9 +102,8 @@ PRODUCT_CATEGORY_OPTIONS = {
     "integrations": "10193", "expansion": "10194", "feedback": "10577",
 }
 
-# Roadmap column lookup (lowercase name → option ID)
-ROADMAP_COLUMN_LOOKUP = {col["value"].lower(): col["id"] for col in ROADMAP_COLUMNS}
-ROADMAP_COLUMN_LOOKUP.update({"shipped": ROADMAP_SHIPPED_ID, "done": ROADMAP_DONE_ID, "backlog": ROADMAP_BACKLOG_ID})
+# Roadmap column lookup — populated by sync_roadmap_columns() at startup
+# (cannot build here because ROADMAP_COLUMNS is empty until discovery runs)
 
 auth    = (JIRA_EMAIL, JIRA_API_TOKEN)
 headers = {"Accept": "application/json", "Content-Type": "application/json"}
@@ -132,6 +122,123 @@ def discover_reviewed_field():
         log.warning("Could not find 'Reviewed' custom field — JOB 5 will skip Reviewed updates.")
     except Exception as e:
         log.error(f"Failed to discover Reviewed field: {e}")
+
+
+def sync_roadmap_columns():
+    """Ensure 12 roadmap columns exist (6 months × S1/S2), discover IDs, set yellow color."""
+    import calendar
+    global ROADMAP_COLUMNS, COLUMN_RANK, ROADMAP_COLUMN_LOOKUP
+
+    today = datetime.now()
+    cur_month, cur_year = today.month, today.year
+
+    # Generate the 12 column names we need (current month + 5 months ahead)
+    needed_names = []
+    for i in range(6):
+        m = (cur_month + i - 1) % 12 + 1
+        y = cur_year + (cur_month + i - 1) // 12
+        month_name = calendar.month_name[m]
+        needed_names.append(f"{month_name} (S1)")
+        needed_names.append(f"{month_name} (S2)")
+
+    log.info(f"Roadmap columns needed: {needed_names[0]} → {needed_names[-1]}")
+
+    # ── Step 1: Discover all existing options for the Roadmap field ──
+    discovered = dict(KNOWN_ROADMAP_OPTIONS)  # Start with seed values
+    try:
+        # Query issues to find any option IDs not in seed data
+        data = jira_get("/rest/api/3/search/jql", params={
+            "jql": f'project = {AR_PROJECT_KEY} AND cf[10560] is not EMPTY',
+            "fields": ROADMAP_FIELD, "maxResults": 100,
+        })
+        for issue in data.get("issues", []):
+            opt = (issue.get("fields", {}).get(ROADMAP_FIELD) or {})
+            if opt.get("value") and opt.get("id"):
+                discovered[opt["value"]] = str(opt["id"])
+    except Exception as e:
+        log.warning(f"Roadmap option discovery via issues failed: {e}")
+
+    # ── Step 2: Try to discover options via custom field context API ──
+    context_id = None
+    try:
+        ctx_data = jira_get(f"/rest/api/3/field/customfield_10560/context")
+        contexts = ctx_data.get("values", [])
+        if contexts:
+            context_id = contexts[0]["id"]
+            opts_data = jira_get(f"/rest/api/3/field/customfield_10560/context/{context_id}/option", params={"maxResults": 100})
+            for opt in opts_data.get("values", []):
+                discovered[opt["value"]] = str(opt["id"])
+            log.info(f"Discovered {len(opts_data.get('values', []))} roadmap options via context API.")
+    except Exception as e:
+        log.info(f"Context API not available for roadmap field (JPD): {e}")
+
+    # ── Step 3: Create missing columns ──
+    for name in needed_names:
+        if name in discovered:
+            continue
+        log.info(f"  Creating missing roadmap column: {name}")
+        if context_id:
+            try:
+                ok, resp = jira_post(
+                    f"/rest/api/3/field/customfield_10560/context/{context_id}/option",
+                    {"options": [{"value": name}]}
+                )
+                if ok:
+                    new_opts = resp.json().get("options", [])
+                    if new_opts:
+                        discovered[name] = str(new_opts[0]["id"])
+                        log.info(f"    Created: {name} → ID {discovered[name]}")
+                else:
+                    log.warning(f"    Failed to create column {name}: {resp.status_code} {resp.text[:200]}")
+            except Exception as e:
+                log.warning(f"    Failed to create column {name}: {e}")
+        else:
+            log.warning(f"    Cannot create {name} — no context API. Create manually in JPD.")
+
+    # ── Step 4: Build the ordered ROADMAP_COLUMNS list ──
+    columns = []
+    for name in needed_names:
+        if name in discovered:
+            columns.append({"value": name, "id": discovered[name]})
+        else:
+            log.warning(f"  Roadmap column {name} has no ID — excluded from prioritisation.")
+    ROADMAP_COLUMNS = columns
+    COLUMN_RANK = {col["id"]: idx for idx, col in enumerate(ROADMAP_COLUMNS)}
+    COLUMN_RANK[ROADMAP_BACKLOG_ID] = 999
+    ROADMAP_COLUMN_LOOKUP = {col["value"].lower(): col["id"] for col in ROADMAP_COLUMNS}
+    ROADMAP_COLUMN_LOOKUP.update({"shipped": ROADMAP_SHIPPED_ID, "done": ROADMAP_DONE_ID, "backlog": ROADMAP_BACKLOG_ID})
+
+    log.info(f"Roadmap: {len(ROADMAP_COLUMNS)} columns active ({ROADMAP_COLUMNS[0]['value']} → {ROADMAP_COLUMNS[-1]['value']})" if ROADMAP_COLUMNS else "Roadmap: 0 columns!")
+
+    # ── Step 5: Set yellow color on roadmap columns (3rd darkest yellow) ──
+    if context_id:
+        non_special_ids = [col["id"] for col in ROADMAP_COLUMNS]
+        if non_special_ids:
+            try:
+                # JPD uses color keys: yellow with 5 shades (lightest→darkest)
+                # 3rd darkest = middle shade
+                update_payload = {"options": [
+                    {"id": opt_id, "value": col["value"]}
+                    for col in ROADMAP_COLUMNS
+                    for opt_id in [col["id"]]
+                ]}
+                # Note: standard Jira API may not support color on JPD options
+                # Attempt via context option update
+                log.info("  Attempting to set yellow color on roadmap columns...")
+                for col in ROADMAP_COLUMNS:
+                    try:
+                        requests.put(
+                            f"{JIRA_BASE_URL}/rest/api/3/field/customfield_10560/context/{context_id}/option",
+                            auth=auth, headers=headers,
+                            json={"options": [{"id": col["id"], "value": col["value"]}]}
+                        )
+                    except Exception:
+                        pass
+                log.info("  Color update attempted (may require manual set in JPD for yellow).")
+            except Exception as e:
+                log.info(f"  Could not set column colors: {e}")
+    else:
+        log.info("  Column colors: set manually in JPD (yellow, 3rd darkest shade).")
 
 DOR_DOD_TASK = '[**Definition of Ready (DoR) - Task Level**](https://axiscrm.atlassian.net/wiki/spaces/CAD/pages/91062273/Delivery+process#Definition-of-Ready-(DoR))   **|**   [**Definition of Done (DoD) - Task Level**](https://axiscrm.atlassian.net/wiki/spaces/CAD/pages/91062273/Delivery+process#Definition-of-Done-(DoD))'
 DOR_DOD_EPIC = '[**Definition of Ready (DoR) - Epic Level**](https://axiscrm.atlassian.net/wiki/spaces/CAD/pages/91062273/Delivery+process#Definition-of-Ready-(DoR))   **|**   [**Definition of Done (DoD) - Epic Level**](https://axiscrm.atlassian.net/wiki/spaces/CAD/pages/91062273/Delivery+process#Definition-of-Done-(DoD))'
@@ -182,7 +289,7 @@ def move_issue_to_sprint(issue_key, sprint_id):
 
 
 def _roadmap_sort_key(issue):
-    """Sort key: roadmap column rank (0=soonest) → RICE value (desc) → Jira priority.
+    """Sort key: roadmap column rank (0=soonest) → Value rating (desc) → Jira priority.
     Tickets connected to the strategic pipeline rank before non-connected ones."""
     f = issue.get("fields", {})
     # Trace: ticket → parent Epic → EPIC_ROADMAP_RANK cache
@@ -190,8 +297,8 @@ def _roadmap_sort_key(issue):
     epic_key = issue["key"] if (f.get("issuetype") or {}).get("name") == "Epic" else parent_key
 
     if epic_key and epic_key in EPIC_ROADMAP_RANK:
-        col_rank, rice_value = EPIC_ROADMAP_RANK[epic_key]
-        return (col_rank, -rice_value, PRIORITY_ORDER.get((f.get("priority") or {}).get("name", ""), 999))
+        col_rank, value_rating = EPIC_ROADMAP_RANK[epic_key]
+        return (col_rank, -value_rating, PRIORITY_ORDER.get((f.get("priority") or {}).get("name", ""), 999))
 
     # Not connected to strategic pipeline — ranks after all roadmap-driven tickets
     return (500, 0, PRIORITY_ORDER.get((f.get("priority") or {}).get("name", ""), 999))
@@ -473,7 +580,7 @@ EXISTING DESCRIPTION:
         base += """
 RULES:
 - Look through the LINKED CONTENT and EXISTING DESCRIPTION for an "Idea" ticket or Confluence page.
-- From the linked Idea/content, extract: whether it is validated (Yes/No), a RICE score, and a PRD link.
+- From the linked Idea/content, extract: whether it is validated (Yes/No), a Value score (1-5 rating), and a PRD link.
 - If a PRD URL exists in the linked content, use the full URL (e.g. "https://...").
 - If any field is not found, use "N/A".
 
@@ -482,7 +589,7 @@ RESPOND IN EXACTLY THIS JSON FORMAT (no markdown fences):
   "polished_summary": "<concise epic title>",
   "pm_summary": "<1-2 sentence summary of what this epic delivers and why>",
   "validated": "<Yes or No or N/A>",
-  "rice_score": "<number or N/A>",
+  "value_score": "<1-5 or N/A>",
   "prd": "<full URL or N/A>"
 }"""
     elif issue_type == "Task":
@@ -573,7 +680,7 @@ def build_description_markdown(issue_type, enrichment):
         return f"""**Product Manager:**
 1. **Summary:** {enrichment.get('pm_summary', '')}
 2. **Validated:** {enrichment.get('validated', 'N/A')}
-3. **RICE score:** {enrichment.get('rice_score', 'N/A')}
+3. **Value score:** {enrichment.get('value_score', 'N/A')}
 4. **PRD:** {enrichment.get('prd', 'N/A')}
 
 {DOR_DOD_EPIC}"""
@@ -724,7 +831,7 @@ def assess_completeness(issue_type, enrichment, story_points):
         checks = [
             has_value(enrichment.get("pm_summary")),
             has_value(enrichment.get("validated")),
-            has_value(enrichment.get("rice_score")),
+            has_value(enrichment.get("value_score")),
             has_value(enrichment.get("prd")),
         ]
     elif issue_type == "Task":
@@ -836,7 +943,7 @@ Verify all split tickets pass their individual test plans.
                 split_desc = f"""**Product Manager:**
 1. **Summary:** {split_note}
 2. **Validated:** N/A
-3. **RICE score:** N/A
+3. **Value score:** N/A
 4. **PRD:** N/A
 
 {DOR_DOD_EPIC}"""
@@ -867,10 +974,10 @@ def get_user_feedback_ideas(scored_only=False):
     """Fetch AR ideas in the 'User Feedback' swimlane."""
     jql = f'project = {AR_PROJECT_KEY} AND cf[10694] = "User Feedback" AND status != Done'
     if scored_only:
-        jql += f' AND cf[10526] is not EMPTY AND cf[10047] is not EMPTY AND cf[10527] is not EMPTY AND cf[10058] is not EMPTY'
+        jql += f' AND cf[10834] is not EMPTY'
     else:
-        jql += f' AND (cf[10526] is EMPTY OR cf[10047] is EMPTY OR cf[10527] is EMPTY OR cf[10058] is EMPTY)'
-    fields = f"summary,description,status,priority,labels,{RICE_REACH_FIELD},{RICE_IMPACT_FIELD},{RICE_CONFIDENCE_FIELD},{RICE_EFFORT_FIELD},{RICE_VALUE_FIELD},{ROADMAP_FIELD},{SWIMLANE_FIELD},{ADVISER_FIELD}"
+        jql += f' AND cf[10834] is EMPTY'
+    fields = f"summary,description,status,priority,labels,{VALUE_FIELD},{ROADMAP_FIELD},{SWIMLANE_FIELD},{ADVISER_FIELD}"
     issues, start_at = [], 0
     while True:
         data = jira_get("/rest/api/3/search/jql", params={"jql": jql, "fields": fields, "maxResults": 50, "startAt": start_at})
@@ -884,7 +991,7 @@ def get_user_feedback_ideas(scored_only=False):
 
 
 def build_feedback_enrichment_prompt(issue):
-    """Build a prompt for Claude to clean up description and score RICE for a user feedback idea."""
+    """Build a prompt for Claude to clean up description and score Value for a user feedback idea."""
     f = issue["fields"]
     summary = f["summary"]
     desc = f.get("description") or ""
@@ -914,36 +1021,32 @@ You must do two things:
    - Separate each quote with a blank line.
    - Preserve the adviser's name from each quote.
 
-2. SCORE RICE (each 1-5):
-   - **Reach** (1-5): How many users does this affect? 1=very few, 2=some, 3=moderate, 4=many, 5=nearly all users
-   - **Impact** (1-5): How significant is the impact when it occurs? 1=minimal, 2=low, 3=moderate, 4=high, 5=critical/blocking
-   - **Confidence** (1-5): How confident are we this is a real problem? 1=speculative, 2=low evidence, 3=some evidence, 4=strong evidence, 5=validated by multiple users
-   - **Effort** (1-5): How much effort to solve? 1=trivial, 2=small, 3=medium, 4=large, 5=massive
+2. SCORE VALUE (1-5):
+   Rate the overall value of this feedback idea on a 1-5 scale:
+   - **5** = Highest value — critical need, affects many users, strong revenue/compliance impact
+   - **4** = High value — significant need, affects many users, clear business benefit
+   - **3** = Medium value — moderate need, some users affected, reasonable benefit
+   - **2** = Low value — minor need, few users affected, limited benefit
+   - **1** = Lowest value — nice-to-have, minimal impact
    
-   Consider: number of distinct users quoted (more = higher reach/confidence), severity of pain described,
-   whether it's a bug vs feature vs workflow issue, compliance/revenue impact, and implementation complexity.
+   Consider: number of distinct users quoted (more = higher value), severity of pain described,
+   whether it's a bug vs feature vs workflow issue, compliance/revenue impact.
 
 RESPOND IN EXACTLY THIS JSON FORMAT (no markdown fences, no extra text):
 {{
   "cleaned_description": "<formatted quotes with 💬 Name: \\"quote\\" format, each separated by blank lines>",
   "adviser_names": ["<list of adviser names extracted from quotes>"],
-  "rice_reach": <1-5>,
-  "rice_impact": <1-5>,
-  "rice_confidence": <1-5>,
-  "rice_effort": <1-5>,
-  "rice_reasoning": "<1-2 sentences explaining the scores>"
+  "value_rating": <1-5>,
+  "value_reasoning": "<1-2 sentences explaining the score>"
 }}"""
 
 
-def update_ar_idea(issue_key, cleaned_desc=None, rice_scores=None):
-    """Update an AR idea with cleaned description and/or RICE scores."""
+def update_ar_idea(issue_key, cleaned_desc=None, value_rating=None):
+    """Update an AR idea with cleaned description and/or Value rating."""
     payload = {"fields": {}}
 
-    if rice_scores:
-        payload["fields"][RICE_REACH_FIELD] = rice_scores.get("reach")
-        payload["fields"][RICE_IMPACT_FIELD] = rice_scores.get("impact")
-        payload["fields"][RICE_CONFIDENCE_FIELD] = rice_scores.get("confidence")
-        payload["fields"][RICE_EFFORT_FIELD] = rice_scores.get("effort")
+    if value_rating is not None:
+        payload["fields"][VALUE_FIELD] = min(max(int(value_rating), 1), 5)
 
     if cleaned_desc:
         payload["update"] = {"description": [{"set": {"version": 1, "type": "doc", "content": markdown_to_adf(cleaned_desc)}}]}
@@ -958,9 +1061,9 @@ def update_ar_idea(issue_key, cleaned_desc=None, rice_scores=None):
 
 
 def prioritise_feedback_ideas():
-    """Re-prioritise all scored User Feedback ideas across Roadmap columns by RICE score."""
-    jql = f'project = {AR_PROJECT_KEY} AND cf[10694] = "User Feedback" AND status != Done AND cf[10526] is not EMPTY AND cf[10047] is not EMPTY AND cf[10527] is not EMPTY AND cf[10058] is not EMPTY'
-    fields = f"summary,{RICE_REACH_FIELD},{RICE_IMPACT_FIELD},{RICE_CONFIDENCE_FIELD},{RICE_EFFORT_FIELD},{ROADMAP_FIELD}"
+    """Re-prioritise all scored User Feedback ideas across Roadmap columns by Value rating."""
+    jql = f'project = {AR_PROJECT_KEY} AND cf[10694] = "User Feedback" AND status != Done AND cf[10834] is not EMPTY'
+    fields = f"summary,{VALUE_FIELD},{ROADMAP_FIELD}"
     issues, start_at = [], 0
     while True:
         data = jira_get("/rest/api/3/search/jql", params={"jql": jql, "fields": fields, "maxResults": 100, "startAt": start_at})
@@ -975,19 +1078,14 @@ def prioritise_feedback_ideas():
         log.info("  No scored User Feedback ideas to prioritise.")
         return
 
-    # Calculate RICE value for each and sort descending
+    # Sort by Value rating descending (5=highest priority)
     for issue in issues:
-        f = issue["fields"]
-        r = f.get(RICE_REACH_FIELD) or 1
-        i = f.get(RICE_IMPACT_FIELD) or 1
-        c = f.get(RICE_CONFIDENCE_FIELD) or 1
-        e = f.get(RICE_EFFORT_FIELD) or 1
-        issue["_rice_value"] = (r * i * c) / e
-    issues.sort(key=lambda x: x["_rice_value"], reverse=True)
+        issue["_value"] = issue["fields"].get(VALUE_FIELD) or 0
+    issues.sort(key=lambda x: x["_value"], reverse=True)
 
     log.info(f"  Prioritising {len(issues)} scored User Feedback ideas across roadmap columns.")
 
-    # Assign to columns: first column gets 2-3 tickets, rest get up to IDEAS_PER_COLUMN
+    # Assign to columns: IDEAS_PER_COLUMN per column
     idx = 0
     for col in ROADMAP_COLUMNS:
         if idx >= len(issues):
@@ -1003,11 +1101,11 @@ def prioritise_feedback_ideas():
                     "fields": {ROADMAP_FIELD: {"id": target_id}}
                 })
                 if ok:
-                    log.info(f"    {issue['key']} (RICE={issue['_rice_value']:.1f}) → {col['value']}")
+                    log.info(f"    {issue['key']} (Value={issue['_value']}) → {col['value']}")
                 else:
                     log.warning(f"    Failed to move {issue['key']} to {col['value']}: {resp.status_code}")
             else:
-                log.info(f"    {issue['key']} (RICE={issue['_rice_value']:.1f}) already in {col['value']}")
+                log.info(f"    {issue['key']} (Value={issue['_value']}) already in {col['value']}")
             idx += 1
             assigned += 1
 
@@ -1020,12 +1118,12 @@ def prioritise_feedback_ideas():
                 "fields": {ROADMAP_FIELD: {"id": ROADMAP_BACKLOG_ID}}
             })
             if ok:
-                log.info(f"    {issue['key']} (RICE={issue['_rice_value']:.1f}) → Backlog")
+                log.info(f"    {issue['key']} (Value={issue['_value']}) → Backlog")
         idx += 1
 
 
 def process_user_feedback():
-    """JOB 6: Process User Feedback ideas — clean descriptions, score RICE, prioritise."""
+    """JOB 6: Process User Feedback ideas — clean descriptions, score Value, prioritise."""
     if not ANTHROPIC_API_KEY:
         log.info("JOB 6 skipped — ANTHROPIC_API_KEY not set.")
         return
@@ -1055,16 +1153,10 @@ def process_user_feedback():
                 continue
 
             cleaned_desc = enrichment.get("cleaned_description")
-            rice_scores = {
-                "reach": min(max(int(enrichment.get("rice_reach", 1)), 1), 5),
-                "impact": min(max(int(enrichment.get("rice_impact", 1)), 1), 5),
-                "confidence": min(max(int(enrichment.get("rice_confidence", 1)), 1), 5),
-                "effort": min(max(int(enrichment.get("rice_effort", 1)), 1), 5),
-            }
-            rice_val = (rice_scores["reach"] * rice_scores["impact"] * rice_scores["confidence"]) / rice_scores["effort"]
+            value_rating = min(max(int(enrichment.get("value_rating", 3)), 1), 5)
 
-            if update_ar_idea(key, cleaned_desc=cleaned_desc, rice_scores=rice_scores):
-                log.info(f"  Completed {key}: R={rice_scores['reach']} I={rice_scores['impact']} C={rice_scores['confidence']} E={rice_scores['effort']} → Value={rice_val:.1f}")
+            if update_ar_idea(key, cleaned_desc=cleaned_desc, value_rating=value_rating):
+                log.info(f"  Completed {key}: Value={value_rating}/5")
             else:
                 log.warning(f"  Failed to update {key}")
     else:
@@ -1138,10 +1230,7 @@ Respond with ONLY a JSON object (no markdown, no backticks, no explanation):
   "labels": "[Modules or Features]",
   "product_category": "[One of: {product_cats}, or null]",
   "discovery": "Validate",
-  "rice_reach": [1-5 estimate],
-  "rice_impact": [1-5 estimate],
-  "rice_confidence": [1-5 estimate],
-  "rice_effort": [1-5 estimate]
+  "value_rating": [1-5 estimate]
 }}
 
 RULES:
@@ -1150,7 +1239,7 @@ RULES:
 {initiative_instructions}
 {labels_rule}
 - ROADMAP: Do NOT include a roadmap_column field. All new ideas go to Backlog automatically.
-- For RICE, make your best estimate given the context. If unsure, use 3 for each.
+- For value_rating, estimate the overall value (5=highest, 1=lowest) based on potential impact and strategic fit.
 - discovery should default to "Validate" unless the user says otherwise."""
 
 
@@ -1208,12 +1297,10 @@ def create_jpd_idea(structured_data, swimlane_id=None):
     if discovery and discovery.lower() in DISCOVERY_OPTIONS:
         fields[DISCOVERY_FIELD] = {"id": DISCOVERY_OPTIONS[discovery.lower()]}
 
-    # RICE scores
-    for key, field_id in [("rice_reach", RICE_REACH_FIELD), ("rice_impact", RICE_IMPACT_FIELD),
-                          ("rice_confidence", RICE_CONFIDENCE_FIELD), ("rice_effort", RICE_EFFORT_FIELD)]:
-        val = structured_data.get(key)
-        if val is not None:
-            fields[field_id] = min(max(int(val), 1), 5)
+    # Value rating
+    val = structured_data.get("value_rating")
+    if val is not None:
+        fields[VALUE_FIELD] = min(max(int(val), 1), 5)
 
     ok, resp = jira_post("/rest/api/3/issue", {"fields": fields})
     if ok:
@@ -1292,14 +1379,7 @@ def process_telegram_idea(user_text, chat_id, bot, swimlane_id=None):
     issue_key = create_jpd_idea(structured, swimlane_id=swimlane_id)
     if issue_key:
         summary = structured.get("summary", "Untitled")
-        rice_r = structured.get("rice_reach", 3)
-        rice_i = structured.get("rice_impact", 3)
-        rice_c = structured.get("rice_confidence", 3)
-        rice_e = structured.get("rice_effort", 3)
-        try:
-            rice_value = (int(rice_r) * int(rice_i) * int(rice_c)) / int(rice_e)
-        except (ValueError, ZeroDivisionError):
-            rice_value = 0
+        value_rating = structured.get("value_rating", 3)
 
         link = f"https://axiscrm.atlassian.net/jira/polaris/projects/AR/ideas/view/11184018?selectedIssue={issue_key}"
         lane_name = "User Feedback" if swimlane_id == USER_FEEDBACK_OPTION_ID else "Strategic Initiatives"
@@ -1316,7 +1396,7 @@ def process_telegram_idea(user_text, chat_id, bot, swimlane_id=None):
             f"✅ *{issue_key}* — {summary}\n\n"
             f"🏊 {lane_name}\n"
             f"{initiative_line}\n"
-            f"📊 Value: {rice_value:.1f} / 125\n\n"
+            f"📊 Value: {value_rating} / 5\n\n"
             f"[Open on board]({link})"
         )
         bot.send_message(chat_id, msg, parse_mode="Markdown", disable_web_page_preview=True)
@@ -1637,7 +1717,7 @@ AX_DESCRIPTION_TEMPLATES = {
     "Epic": """**Product Manager:**
 1. **Summary:** {summary}
 2. **Validated:** No
-3. **RICE score:**
+3. **Value score:**
 4. **PRD:**
 
 {dor_dod}""",
@@ -2787,17 +2867,15 @@ def discover_delivery_link_type():
 
 
 def get_strategic_ideas_scored():
-    """Fetch all Strategic Initiatives ideas that have all 4 RICE scores."""
+    """Fetch all Strategic Initiatives ideas that have a Value rating."""
     jql = (
         f'project = {AR_PROJECT_KEY} AND cf[10694] = "Strategic Initiatives"'
         f' AND status != Done'
-        f' AND cf[10526] is not EMPTY AND cf[10047] is not EMPTY'
-        f' AND cf[10527] is not EMPTY AND cf[10058] is not EMPTY'
+        f' AND cf[10834] is not EMPTY'
     )
     fields = (
         f"summary,description,status,priority,issuelinks,"
-        f"{RICE_REACH_FIELD},{RICE_IMPACT_FIELD},{RICE_CONFIDENCE_FIELD},"
-        f"{RICE_EFFORT_FIELD},{ROADMAP_FIELD},{SWIMLANE_FIELD}"
+        f"{VALUE_FIELD},{ROADMAP_FIELD},{SWIMLANE_FIELD}"
     )
     issues, start_at = [], 0
     while True:
@@ -2814,19 +2892,14 @@ def get_strategic_ideas_scored():
 
 
 def prioritise_strategic_ideas(issues):
-    """Re-prioritise scored Strategic Initiatives ideas across Roadmap columns by RICE value."""
+    """Re-prioritise scored Strategic Initiatives ideas across Roadmap columns by Value rating (5=highest)."""
     if not issues:
         log.info("  JOB 15: No scored Strategic Initiatives ideas to prioritise.")
         return
 
     for issue in issues:
-        f = issue["fields"]
-        r = f.get(RICE_REACH_FIELD) or 1
-        i = f.get(RICE_IMPACT_FIELD) or 1
-        c = f.get(RICE_CONFIDENCE_FIELD) or 1
-        e = f.get(RICE_EFFORT_FIELD) or 1
-        issue["_rice_value"] = (r * i * c) / e
-    issues.sort(key=lambda x: x["_rice_value"], reverse=True)
+        issue["_value"] = issue["fields"].get(VALUE_FIELD) or 0
+    issues.sort(key=lambda x: x["_value"], reverse=True)
 
     log.info(f"  JOB 15: Prioritising {len(issues)} Strategic Initiatives ideas across roadmap columns.")
 
@@ -2845,11 +2918,11 @@ def prioritise_strategic_ideas(issues):
                     "fields": {ROADMAP_FIELD: {"id": target_id}}
                 })
                 if ok:
-                    log.info(f"    {issue['key']} (RICE={issue['_rice_value']:.1f}) → {col['value']}")
+                    log.info(f"    {issue['key']} (Value={issue['_value']}) → {col['value']}")
                 else:
                     log.warning(f"    Failed to move {issue['key']} to {col['value']}: {resp.status_code}")
             else:
-                log.info(f"    {issue['key']} (RICE={issue['_rice_value']:.1f}) already in {col['value']}")
+                log.info(f"    {issue['key']} (Value={issue['_value']}) already in {col['value']}")
             idx += 1
             assigned += 1
 
@@ -2861,7 +2934,7 @@ def prioritise_strategic_ideas(issues):
                 "fields": {ROADMAP_FIELD: {"id": ROADMAP_BACKLOG_ID}}
             })
             if ok:
-                log.info(f"    {issue['key']} (RICE={issue['_rice_value']:.1f}) → Backlog")
+                log.info(f"    {issue['key']} (Value={issue['_value']}) → Backlog")
         idx += 1
 
 
@@ -2887,10 +2960,7 @@ def build_delivery_epic_prompt(idea):
     if isinstance(desc, dict):
         desc = adf_to_text(desc)
 
-    rice_r = f.get(RICE_REACH_FIELD) or "?"
-    rice_i = f.get(RICE_IMPACT_FIELD) or "?"
-    rice_c = f.get(RICE_CONFIDENCE_FIELD) or "?"
-    rice_e = f.get(RICE_EFFORT_FIELD) or "?"
+    value_rating = f.get(VALUE_FIELD) or "?"
 
     return f"""You are a senior Product Manager for Axis CRM, a life insurance distribution CRM platform.
 The platform is used by AFSL-licensed insurance advisers to manage clients, policies, applications, quotes, payments and commissions.
@@ -2901,7 +2971,7 @@ You are creating a delivery Epic in the AX (Sprints) project from a strategic in
 
 SOURCE IDEA: {idea["key"]}
 SUMMARY: {summary}
-RICE: Reach={rice_r}, Impact={rice_i}, Confidence={rice_c}, Effort={rice_e}
+VALUE RATING: {value_rating}/5
 DESCRIPTION:
 {desc[:4000]}
 
@@ -3021,14 +3091,10 @@ def process_strategic_pipeline():
         f = idea["fields"]
         col_id = (f.get(ROADMAP_FIELD) or {}).get("id")
         col_rank = COLUMN_RANK.get(col_id, 999)
-        r = f.get(RICE_REACH_FIELD) or 1
-        i = f.get(RICE_IMPACT_FIELD) or 1
-        c = f.get(RICE_CONFIDENCE_FIELD) or 1
-        e = f.get(RICE_EFFORT_FIELD) or 1
-        rice_value = (r * i * c) / e
+        value_rating = f.get(VALUE_FIELD) or 0
         epic_key = get_idea_delivery_epic(f.get("issuelinks") or [])
         if epic_key:
-            EPIC_ROADMAP_RANK[epic_key] = (col_rank, rice_value)
+            EPIC_ROADMAP_RANK[epic_key] = (col_rank, value_rating)
     log.info(f"  JOB 15: Cached {len(EPIC_ROADMAP_RANK)} epic(s) with roadmap ranks.")
 
     if not ANTHROPIC_API_KEY:
@@ -3076,17 +3142,13 @@ def process_strategic_pipeline():
         # Build Epic description with template
         epic_data = structured.get("epic", {})
         f = idea["fields"]
-        rice_r = f.get(RICE_REACH_FIELD) or "?"
-        rice_i = f.get(RICE_IMPACT_FIELD) or "?"
-        rice_c = f.get(RICE_CONFIDENCE_FIELD) or "?"
-        rice_e = f.get(RICE_EFFORT_FIELD) or "?"
-        rice_line = f"{rice_r}R · {rice_i}I · {rice_c}C · {rice_e}E"
+        value_rating = f.get(VALUE_FIELD) or "?"
 
         epic_desc_md = (
             f"**Product Manager:**\n"
             f"1. **Summary:** {epic_data.get('description_summary', '')}\n"
             f"2. **Validated:** No\n"
-            f"3. **RICE score:** {rice_line}\n"
+            f"3. **Value score:** {value_rating}/5\n"
             f"4. **PRD:**\n"
             f"5. **Source idea:** [{idea_key}](https://axiscrm.atlassian.net/browse/{idea_key})\n\n"
             f"{DOR_DOD_EPIC}"
@@ -3113,14 +3175,9 @@ def process_strategic_pipeline():
 
         # Update ranking cache for new epic
         idea_col_id = (idea["fields"].get(ROADMAP_FIELD) or {}).get("id")
-        idea_f = idea["fields"]
-        _r = idea_f.get(RICE_REACH_FIELD) or 1
-        _i = idea_f.get(RICE_IMPACT_FIELD) or 1
-        _c = idea_f.get(RICE_CONFIDENCE_FIELD) or 1
-        _e = idea_f.get(RICE_EFFORT_FIELD) or 1
         EPIC_ROADMAP_RANK[epic_key] = (
             COLUMN_RANK.get(idea_col_id, 999),
-            (_r * _i * _c) / _e
+            idea["fields"].get(VALUE_FIELD) or 0
         )
 
         # Create child tickets
@@ -3833,6 +3890,7 @@ if __name__ == "__main__":
     log.info("Scheduler started — core loop every 30min (7am-6pm), briefing 7:30am, EOD 5:30pm, Product Weekly Fri 7am AEDT.")
     discover_reviewed_field()
     discover_delivery_link_type()
+    sync_roadmap_columns()
 
     # Start Telegram bot in a daemon thread (runs alongside scheduler)
     if TELEGRAM_BOT_TOKEN:
