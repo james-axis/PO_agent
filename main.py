@@ -491,7 +491,8 @@ _INITIATIVE_ID_TO_NAME = {v: k for k, v in INITIATIVE_OPTIONS.items()}
 
 
 def _idea_sort_key(idea):
-    """Sort key for ideas within a roadmap column: group by module name → lifecycle order."""
+    """Sort key for ideas: group by module name → column position → lifecycle order.
+    Global ranking ensures same-module ideas align horizontally across columns."""
     initiatives = idea["fields"].get(INITIATIVE_FIELD) or []
     init_ids = [i.get("id") for i in initiatives if isinstance(i, dict)]
 
@@ -508,12 +509,17 @@ def _idea_sort_key(idea):
             if name and name not in ("voa",):
                 module_name = name
 
-    return (module_name or "zzz", lifecycle_rank)
+    # Column rank for left→right ordering within a module
+    col_id = (idea["fields"].get(ROADMAP_FIELD) or {}).get("id")
+    col_rank = COLUMN_RANK.get(col_id, 999)
+
+    return (module_name or "zzz", lifecycle_rank, col_rank)
 
 
 def organise_roadmap_ideas():
-    """JOB 17: Organise ideas within each roadmap column by initiative module grouping and lifecycle order.
-    Groups same-module ideas together, ordered: Workflows → Modules → MVP → Iteration → Features."""
+    """JOB 17: Organise ideas across the entire roadmap by initiative module.
+    Uses GLOBAL ranking so same-module ideas align horizontally across columns.
+    Sort order: module group → lifecycle (Workflows→Modules→MVP→Iteration→Features) → column position."""
     log.info("JOB 17: Organising roadmap ideas by initiative lifecycle...")
 
     if not ROADMAP_COLUMNS:
@@ -535,49 +541,30 @@ def organise_roadmap_ideas():
             break
         start_at += len(batch)
 
-    if not all_ideas:
-        log.info("  JOB 17: No ideas found.")
+    if len(all_ideas) < 2:
+        log.info(f"  JOB 17: Only {len(all_ideas)} idea(s), skipping.")
         return
 
-    # Group ideas by roadmap column ID
-    col_lookup = {col["id"]: col["value"] for col in ROADMAP_COLUMNS}
-    if ROADMAP_BACKLOG_ID:
-        col_lookup[ROADMAP_BACKLOG_ID] = "Backlog"
+    # Sort ALL ideas globally: module → lifecycle → column position
+    all_ideas.sort(key=_idea_sort_key)
+    keys = [i["key"] for i in all_ideas]
 
-    ideas_by_col = {}
+    # Apply global ranking via agile API
+    log.info(f"  JOB 17: Ranking {len(keys)} ideas globally for horizontal module alignment...")
+    for idx in range(len(keys) - 2, -1, -1):
+        ok, r = jira_put("/rest/agile/1.0/issue/rank", {
+            "issues": [keys[idx]], "rankBeforeIssue": keys[idx + 1]
+        })
+        if not ok:
+            log.warning(f"  JOB 17: Failed ranking {keys[idx]}: {r.status_code}")
+
+    # Log module groupings
+    groups = {}
     for idea in all_ideas:
-        col_id = (idea["fields"].get(ROADMAP_FIELD) or {}).get("id")
-        if col_id and col_id in col_lookup:
-            ideas_by_col.setdefault(col_id, []).append(idea)
-
-    total_ranked = 0
-    for col_id, ideas in ideas_by_col.items():
-        col_name = col_lookup[col_id]
-        if len(ideas) < 2:
-            continue
-
-        # Sort by module grouping → lifecycle order
-        ideas.sort(key=_idea_sort_key)
-        keys = [i["key"] for i in ideas]
-
-        # Apply ranking via agile API
-        for idx in range(len(keys) - 2, -1, -1):
-            ok, r = jira_put("/rest/agile/1.0/issue/rank", {
-                "issues": [keys[idx]], "rankBeforeIssue": keys[idx + 1]
-            })
-            if not ok:
-                log.warning(f"  JOB 17: Failed ranking {keys[idx]} in {col_name}: {r.status_code}")
-
-        # Log grouping for this column
-        groups = {}
-        for idea in ideas:
-            mod, lc = _idea_sort_key(idea)
-            groups.setdefault(mod, []).append(idea["key"])
-        group_summary = ", ".join(f"{m.title()}({len(v)})" for m, v in groups.items())
-        log.info(f"  {col_name}: {len(ideas)} ideas ranked — {group_summary}")
-        total_ranked += len(ideas)
-
-    log.info(f"JOB 17: Organised {total_ranked} ideas across {len(ideas_by_col)} columns.")
+        mod, lc, col = _idea_sort_key(idea)
+        groups.setdefault(mod, []).append(idea["key"])
+    group_summary = ", ".join(f"{m.title()}({len(v)})" for m, v in groups.items())
+    log.info(f"JOB 17: Organised {len(all_ideas)} ideas globally — {group_summary}")
 
 def next_tuesday(dt):
     days = (1 - dt.weekday()) % 7
