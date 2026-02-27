@@ -1328,6 +1328,8 @@ def start_telegram_bot():
             "*🧠 /strategic* — Create idea → Strategic Initiatives swimlane\n"
             "*💬 /feedback* — Create idea → User Feedback swimlane\n"
             "*🔨 /backlog* — Create Epic + broken-down tickets in Sprints\n"
+            "*✏️ /update* — Edit an existing ticket (summary, description, fields)\n"
+            "*➕ /add* — Create tickets under an existing epic\n"
             "*📋 /productweekly* — Review actions & add callouts to weekly meeting\n\n"
             "Send a text or voice note after selecting a mode.\n"
             "Default mode: /strategic",
@@ -1351,6 +1353,32 @@ def start_telegram_bot():
         save_chat_id(message.chat.id)
         user_mode[message.chat.id] = {"mode": "backlog", "swimlane": STRATEGIC_INITIATIVES_ID}
         bot.reply_to(message, "🔨 *Backlog mode* — describe what needs building.", parse_mode="Markdown")
+
+    @bot.message_handler(commands=["update"])
+    def handle_update(message):
+        save_chat_id(message.chat.id)
+        user_mode[message.chat.id] = {"mode": "update"}
+        bot.reply_to(message,
+            "✏️ *Update mode* — send the ticket ID and what to change.\n\n"
+            "Examples:\n"
+            "• `AX-123 change acceptance criteria to include admin validation`\n"
+            "• `AX-456 set story points to 2`\n"
+            "• `AR-78 update summary to Campaign ROI Dashboard`\n\n"
+            "Or just send the ticket ID first, then the changes.",
+            parse_mode="Markdown")
+
+    @bot.message_handler(commands=["add"])
+    def handle_add(message):
+        save_chat_id(message.chat.id)
+        user_mode[message.chat.id] = {"mode": "add"}
+        bot.reply_to(message,
+            "➕ *Add mode* — create tickets under an existing epic.\n\n"
+            "Examples:\n"
+            "• `AX-50 bug: date picker crashes when selecting past dates`\n"
+            "• `AX-50 task: add CSV export to campaign report`\n"
+            "• `AX-50 need a spike to investigate API rate limits and a task to add retry logic`\n\n"
+            "Or just send the epic ID first, then describe the ticket(s).",
+            parse_mode="Markdown")
 
     @bot.message_handler(commands=["productweekly"])
     def handle_product_weekly(message):
@@ -1429,9 +1457,16 @@ def start_telegram_bot():
     def handle_done(message):
         save_chat_id(message.chat.id)
         state = user_mode.get(message.chat.id, {})
-        if state.get("mode") == "weekly":
+        mode = state.get("mode")
+        if mode == "weekly":
             user_mode[message.chat.id] = {"mode": "roadmap", "swimlane": STRATEGIC_INITIATIVES_ID}
             bot.reply_to(message, "✅ Product Weekly session finished.", parse_mode="Markdown")
+        elif mode == "update":
+            user_mode[message.chat.id] = {"mode": "roadmap", "swimlane": STRATEGIC_INITIATIVES_ID}
+            bot.reply_to(message, "✅ Update mode finished.", parse_mode="Markdown")
+        elif mode == "add":
+            user_mode[message.chat.id] = {"mode": "roadmap", "swimlane": STRATEGIC_INITIATIVES_ID}
+            bot.reply_to(message, "✅ Add mode finished.", parse_mode="Markdown")
         else:
             bot.reply_to(message, "Nothing to finish. Use /help for commands.")
 
@@ -1470,6 +1505,10 @@ def start_telegram_bot():
                             f"({len(pending_weekly_callouts)} callout(s) queued)\n\n"
                             f"Send more or /done to finish.",
                             parse_mode="Markdown")
+                elif state.get("mode") == "update":
+                    process_telegram_update(text, message.chat.id, bot, state, user_mode)
+                elif state.get("mode") == "add":
+                    process_telegram_add(text, message.chat.id, bot, state, user_mode)
                 elif state["mode"] == "backlog":
                     process_telegram_work(text, message.chat.id, bot)
                 else:
@@ -1484,7 +1523,7 @@ def start_telegram_bot():
     def handle_text(message):
         save_chat_id(message.chat.id)
         if message.text.startswith("/"):
-            bot.reply_to(message, "Unknown command. Try /strategic, /feedback, /backlog, /productweekly, or /help")
+            bot.reply_to(message, "Unknown command. Try /strategic, /feedback, /backlog, /update, /add, /productweekly, or /help")
             return
         state = user_mode.get(message.chat.id, {"mode": "roadmap", "swimlane": STRATEGIC_INITIATIVES_ID})
 
@@ -1531,6 +1570,10 @@ def start_telegram_bot():
                         f"({len(pending_weekly_callouts)} callout(s) queued)\n\n"
                         f"Send more or /done to finish.",
                         parse_mode="Markdown")
+        elif state.get("mode") == "update":
+            process_telegram_update(message.text.strip(), message.chat.id, bot, state, user_mode)
+        elif state.get("mode") == "add":
+            process_telegram_add(message.text.strip(), message.chat.id, bot, state, user_mode)
         elif state["mode"] == "backlog":
             process_telegram_work(message.text, message.chat.id, bot)
         else:
@@ -1724,6 +1767,297 @@ def transition_to_ready(issue_key):
     else:
         log.warning(f"  JOB 8: Failed to transition {issue_key}: {resp.status_code} {resp.text[:200]}")
     return ok
+
+
+def extract_ticket_key(text):
+    """Extract a Jira ticket key (AX-123 or AR-45) from the start of text. Returns (key, remaining_text) or (None, text)."""
+    m = re.match(r'\s*((?:AX|AR|ARU)-\d+)\s*(.*)', text, re.IGNORECASE | re.DOTALL)
+    if m:
+        return m.group(1).upper(), m.group(2).strip()
+    return None, text
+
+
+def build_update_prompt(issue_key, issue_type, current_summary, current_desc_text, current_sp, user_instruction):
+    """Build Claude prompt to interpret update instructions."""
+    return f"""You are a senior Product Manager for Axis CRM, a life insurance distribution CRM platform.
+
+You need to apply an update to an existing Jira ticket based on the user's instruction.
+
+CURRENT TICKET:
+- Key: {issue_key}
+- Type: {issue_type}
+- Summary: {current_summary}
+- Story Points: {current_sp}
+- Current Description:
+{current_desc_text}
+
+USER INSTRUCTION:
+{user_instruction}
+
+Respond with ONLY a JSON object (no markdown, no backticks):
+
+{{
+  "summary": "Updated summary (or null to keep current)",
+  "story_points": null,
+  "description_changes": "A clear description of what sections to update and the new content. Be specific about which PM/Engineer sections to modify. Set to null if no description changes.",
+  "updated_description": "The FULL updated description in markdown if changes are needed (preserving the existing template structure and all sections). Set to null if no description changes."
+}}
+
+RULES:
+- Only change what the user asked for. Preserve everything else exactly.
+- If the user mentions story points or SP, update story_points (must be 0.25, 0.5, 1, 2, or 3).
+- If the user mentions summary/title, update summary.
+- For description changes, always preserve the PM/Engineer section structure and DoR/DoD links.
+- Be thoughtful — a brief instruction like "add admin validation to AC" means add it to existing acceptance criteria, not replace them.
+- Set fields to null if they shouldn't change."""
+
+
+def process_telegram_update(text, chat_id, bot, state, user_mode):
+    """Process an update instruction for an existing ticket."""
+    ticket_key = state.get("ticket_key")
+    instruction = text
+
+    # If no ticket key yet, try to extract from this message
+    if not ticket_key:
+        ticket_key, instruction = extract_ticket_key(text)
+        if not ticket_key:
+            bot.send_message(chat_id, "❓ I need a ticket ID (e.g. AX-123). Send the ticket ID and what to change.")
+            return
+        state["ticket_key"] = ticket_key
+        user_mode[chat_id] = state
+
+    # If we have a key but no instruction, ask for it
+    if not instruction:
+        # Fetch and show current ticket
+        bot.send_message(chat_id, f"🔍 Loading {ticket_key}...")
+        issue = jira_get(f"/rest/api/3/issue/{ticket_key}", params={
+            "fields": f"summary,issuetype,status,{STORY_POINTS_FIELD},description"
+        })
+        if not issue or "fields" not in issue:
+            bot.send_message(chat_id, f"❌ Couldn't find {ticket_key}. Check the ticket ID.")
+            state.pop("ticket_key", None)
+            return
+
+        f = issue["fields"]
+        summary = f.get("summary", "")
+        itype = f.get("issuetype", {}).get("name", "?")
+        status = f.get("status", {}).get("name", "?")
+        sp = f.get(STORY_POINTS_FIELD) or "—"
+
+        bot.send_message(chat_id,
+            f"✏️ *{ticket_key}* ({itype} · {status} · {sp} SP)\n"
+            f"_{summary}_\n\n"
+            f"What do you want to change?",
+            parse_mode="Markdown")
+        return
+
+    # We have both key and instruction — process
+    bot.send_message(chat_id, f"✏️ Updating {ticket_key}...")
+
+    issue = jira_get(f"/rest/api/3/issue/{ticket_key}", params={
+        "fields": f"summary,issuetype,status,{STORY_POINTS_FIELD},description"
+    })
+    if not issue or "fields" not in issue:
+        bot.send_message(chat_id, f"❌ Couldn't find {ticket_key}.")
+        return
+
+    f = issue["fields"]
+    current_summary = f.get("summary", "")
+    itype = f.get("issuetype", {}).get("name", "Task")
+    current_sp = f.get(STORY_POINTS_FIELD)
+    desc_adf = f.get("description") or {}
+    current_desc_text = adf_to_text(desc_adf) if desc_adf else ""
+
+    prompt = build_update_prompt(ticket_key, itype, current_summary, current_desc_text, current_sp, instruction)
+    response = call_claude(prompt, max_tokens=4096)
+    if not response:
+        bot.send_message(chat_id, "❌ AI processing failed.")
+        return
+
+    try:
+        clean = re.sub(r'^```(?:json)?\s*', '', response)
+        clean = re.sub(r'\s*```$', '', clean)
+        updates = json.loads(clean)
+    except json.JSONDecodeError as e:
+        log.error(f"Update parse error: {e}\nRaw: {response[:500]}")
+        bot.send_message(chat_id, "❌ Failed to parse AI response. Try rephrasing.")
+        return
+
+    # Apply updates
+    new_summary = updates.get("summary")
+    new_sp = updates.get("story_points")
+    new_desc = updates.get("updated_description")
+
+    changes = []
+    if new_summary and new_summary != current_summary:
+        changes.append(f"📝 Summary → _{new_summary}_")
+    if new_sp is not None and new_sp != current_sp:
+        changes.append(f"🎯 Story Points → {new_sp}")
+    if new_desc:
+        desc_change = updates.get("description_changes", "Description updated")
+        changes.append(f"📄 {desc_change}")
+
+    if not changes:
+        bot.send_message(chat_id, f"🤷 No changes needed for {ticket_key} based on your instruction.")
+        return
+
+    ok = update_issue_fields(
+        ticket_key,
+        summary=new_summary if new_summary and new_summary != current_summary else None,
+        description_md=new_desc,
+        story_points=new_sp if new_sp is not None else None,
+        reviewed_value=None,  # Don't change reviewed status
+    )
+
+    if ok:
+        link = f"https://axiscrm.atlassian.net/browse/{ticket_key}"
+        change_list = "\n".join(changes)
+        bot.send_message(chat_id,
+            f"✅ *{ticket_key} updated:*\n{change_list}\n\n"
+            f"[Open ticket]({link})\n\n"
+            f"Send another ticket ID + changes, or /done to exit.",
+            parse_mode="Markdown", disable_web_page_preview=True)
+    else:
+        bot.send_message(chat_id, f"❌ Failed to update {ticket_key}. Check the logs.")
+
+    # Clear ticket key for next update
+    state.pop("ticket_key", None)
+    user_mode[chat_id] = state
+
+
+def build_add_prompt(epic_key, epic_summary, user_instruction):
+    """Build Claude prompt to create child tickets under an epic."""
+    return f"""You are a senior Product Manager for Axis CRM, a life insurance distribution CRM platform.
+The platform is used by AFSL-licensed insurance advisers to manage clients, policies, applications, quotes, payments and commissions.
+Partner insurers include TAL, Zurich, AIA, MLC Life, MetLife, Resolution Life, Integrity Life and others.
+
+You need to create one or more child tickets under an existing epic based on the user's description.
+
+PARENT EPIC:
+- Key: {epic_key}
+- Summary: {epic_summary}
+
+USER REQUEST:
+{user_instruction}
+
+Respond with ONLY a JSON object (no markdown, no backticks):
+
+{{
+  "tickets": [
+    {{
+      "type": "Task",
+      "summary": "Clear task summary",
+      "priority": "Medium",
+      "story_points": 2,
+      "user_story": "As a [user], I want [goal] so that [benefit]",
+      "acceptance_criteria": ["Criterion 1", "Criterion 2"],
+      "test_plan": ["Test step 1", "Test step 2"]
+    }}
+  ]
+}}
+
+RULES:
+- Ticket types: Task, Bug, Spike, Support, Maintenance. Choose the most appropriate.
+- Tasks MUST include user_story, acceptance_criteria (array), and test_plan (array).
+- Bug, Spike, Support only need summary and investigation_summary.
+- Maintenance only needs summary.
+- NO ticket can exceed 3 story points (3pts = 6hrs, 2pts = 4hrs, 1pt = 2hrs, 0.5pt = 1hr, 0.25pt = 30min).
+- If the user describes one ticket, create one. If they describe multiple, create multiple.
+- story_points must be one of: 0.25, 0.5, 1, 2, 3.
+- Priority: choose from Lowest, Low, Medium, High, Highest.
+- Write substantive descriptions — don't just parrot the input."""
+
+
+def process_telegram_add(text, chat_id, bot, state, user_mode):
+    """Process adding new ticket(s) under an existing epic."""
+    epic_key = state.get("epic_key")
+    instruction = text
+
+    # If no epic key yet, try to extract from this message
+    if not epic_key:
+        epic_key, instruction = extract_ticket_key(text)
+        if not epic_key:
+            bot.send_message(chat_id, "❓ I need an epic ID (e.g. AX-50). Send the epic ID and describe the ticket(s).")
+            return
+        state["epic_key"] = epic_key
+        user_mode[chat_id] = state
+
+    # Validate it's an Epic
+    if not state.get("epic_validated"):
+        issue = jira_get(f"/rest/api/3/issue/{epic_key}", params={"fields": "summary,issuetype"})
+        if not issue or "fields" not in issue:
+            bot.send_message(chat_id, f"❌ Couldn't find {epic_key}. Check the ticket ID.")
+            state.pop("epic_key", None)
+            return
+
+        itype = issue["fields"].get("issuetype", {}).get("name", "")
+        if itype != "Epic":
+            bot.send_message(chat_id, f"⚠️ {epic_key} is a {itype}, not an Epic. Send an Epic ID.")
+            state.pop("epic_key", None)
+            return
+
+        state["epic_summary"] = issue["fields"].get("summary", "")
+        state["epic_validated"] = True
+        user_mode[chat_id] = state
+
+    # If no instruction, ask for it
+    if not instruction:
+        bot.send_message(chat_id,
+            f"➕ *{epic_key}* — _{state.get('epic_summary', '')}_\n\n"
+            f"Describe the ticket(s) to add (type, what it does, etc.).",
+            parse_mode="Markdown")
+        return
+
+    # We have both — process
+    bot.send_message(chat_id, f"➕ Creating ticket(s) under {epic_key}...")
+
+    prompt = build_add_prompt(epic_key, state.get("epic_summary", ""), instruction)
+    response = call_claude(prompt, max_tokens=4096)
+    if not response:
+        bot.send_message(chat_id, "❌ AI processing failed.")
+        return
+
+    try:
+        clean = re.sub(r'^```(?:json)?\s*', '', response)
+        clean = re.sub(r'\s*```$', '', clean)
+        structured = json.loads(clean)
+    except json.JSONDecodeError as e:
+        log.error(f"Add parse error: {e}\nRaw: {response[:500]}")
+        bot.send_message(chat_id, "❌ Failed to parse AI response. Try rephrasing.")
+        return
+
+    tickets = structured.get("tickets", [])
+    if not tickets:
+        bot.send_message(chat_id, "❌ No tickets generated. Try describing the work differently.")
+        return
+
+    created = []
+    total_pts = 0
+    for ticket in tickets:
+        ticket_type = ticket.get("type", "Task")
+        if ticket_type not in ("Task", "Bug", "Spike", "Support", "Maintenance"):
+            ticket_type = "Task"
+        child_key = create_ax_ticket(ticket, ticket_type, parent_key=epic_key)
+        if child_key:
+            transition_to_ready(child_key)
+            pts = ticket.get("story_points", 0) or 0
+            total_pts += pts
+            created.append({"key": child_key, "type": ticket_type, "summary": ticket.get("summary", ""), "points": pts})
+
+    if created:
+        ticket_lines = "\n".join(
+            f"  • {t['key']} ({t['type']}, {t['points']}SP) — {t['summary'][:60]}"
+            for t in created
+        )
+        epic_link = f"https://axiscrm.atlassian.net/browse/{epic_key}"
+        bot.send_message(chat_id,
+            f"✅ *{len(created)} ticket(s)* added to {epic_key} ({total_pts} SP):\n"
+            f"{ticket_lines}\n\n"
+            f"[Open epic]({epic_link})\n\n"
+            f"Send more tickets to add, a different epic ID, or /done to exit.",
+            parse_mode="Markdown", disable_web_page_preview=True)
+    else:
+        bot.send_message(chat_id, "❌ Failed to create tickets. Check the logs.")
 
 
 def process_telegram_work(user_text, chat_id, bot):
