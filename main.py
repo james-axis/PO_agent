@@ -32,7 +32,21 @@ AR_PROJECT_KEY     = "AR"
 ROADMAP_FIELD      = "customfield_10560"
 SWIMLANE_FIELD     = "customfield_10694"
 ADVISER_FIELD      = "customfield_10696"
-USER_FEEDBACK_OPTION_ID = "10575"
+PHASE_FIELD        = "customfield_10867"
+
+# Swimlane option IDs
+EXPERIENCE_SWIMLANE_ID = "10682"
+CAPABILITY_SWIMLANE_ID = "10681"
+OTHER_SWIMLANE_ID      = "10685"
+SWIMLANE_OPTIONS = {
+    "experience": EXPERIENCE_SWIMLANE_ID,
+    "capability": CAPABILITY_SWIMLANE_ID,
+    "other": OTHER_SWIMLANE_ID,
+}
+
+# Phase option IDs
+PHASE_MVP_ID       = "10683"
+PHASE_ITERATION_ID = "10684"
 
 # Known roadmap option IDs (seed values — sync_roadmap_columns() discovers more at startup)
 KNOWN_ROADMAP_OPTIONS = {
@@ -71,7 +85,6 @@ ARCHIVE_TYPE_MAP = {
 }
 
 # JPD Idea field option IDs
-STRATEGIC_INITIATIVES_ID = "10574"
 DISCOVERY_FIELD    = "customfield_10049"
 INITIATIVE_FIELD   = "customfield_10628"
 PRODUCT_CAT_FIELD  = "customfield_10391"
@@ -83,17 +96,14 @@ DISCOVERY_OPTIONS = {
 }
 
 INITIATIVE_OPTIONS = {
-    "crm facelift": "10272", "iextend feature": "10273", "payments module": "10310",
-    "insurance module": "10311", "extension feature": "10348", "compliance module": "10350",
-    "ai assistant feature": "10351", "notification feature": "10384", "quoting feature": "10385",
-    "onboarding module": "10386", "services module": "10387", "application module": "10388",
-    "dashboard module": "10389", "training module": "10390", "complaints module": "10391",
-    "claims module": "10392", "dishonours module": "10393", "task feature": "10394",
-    "website": "10397", "client portal module": "10396", "client profile module": "10430",
-    "system": "10463", "voa": "10576",
-    # Scope tags
-    "mvp": "10346", "iteration": "10347", "modules": "10533",
-    "workflows": "10534", "features": "10535",
+    "crm facelift": "10272", "iextend": "10273", "payments": "10310",
+    "insurance": "10311", "extension": "10348", "compliance": "10350",
+    "ai assistant": "10351", "notification": "10384", "quoting": "10385",
+    "onboarding": "10386", "services": "10387", "application": "10388",
+    "dashboard": "10389", "training": "10390", "complaints": "10391",
+    "claims": "10392", "dishonours": "10393", "task": "10394",
+    "website": "10397", "client portal": "10396", "client profile": "10430",
+    "system": "10463",
 }
 
 PRODUCT_CATEGORY_OPTIONS = {
@@ -477,58 +487,52 @@ def rank_issues(issues, label):
 
 # ── JOB 17: Organise Roadmap Ideas by Initiative Lifecycle ───────────────────
 
-# IDs for stage/scope initiative tags (not modules)
-_LIFECYCLE_IDS = {
-    INITIATIVE_OPTIONS.get("workflows", ""): 0,   # Workflows first
-    INITIATIVE_OPTIONS.get("modules", ""): 1,      # Modules second
-    INITIATIVE_OPTIONS.get("mvp", ""): 2,          # MVP third
-    INITIATIVE_OPTIONS.get("iteration", ""): 3,    # Iteration fourth
-    INITIATIVE_OPTIONS.get("features", ""): 4,     # Features last
-}
-_STAGE_SCOPE_IDS = set(_LIFECYCLE_IDS.keys()) - {""}
 # Reverse lookup: option_id → display name
 _INITIATIVE_ID_TO_NAME = {v: k for k, v in INITIATIVE_OPTIONS.items()}
 
+# Phase ranking: MVP before Iteration
+_PHASE_RANK = {PHASE_MVP_ID: 0, PHASE_ITERATION_ID: 1}
+
 
 def _idea_sort_key(idea):
-    """Sort key for ideas: group by module name → column position → lifecycle order.
+    """Sort key for ideas: group by module name → phase (MVP→Iteration) → column position.
     Global ranking ensures same-module ideas align horizontally across columns."""
     initiatives = idea["fields"].get(INITIATIVE_FIELD) or []
     init_ids = [i.get("id") for i in initiatives if isinstance(i, dict)]
 
-    # Separate module from stage/scope
+    # Get module name from initiative tags
     module_name = ""
-    lifecycle_rank = 99  # Default: untagged ideas go last
-
     for iid in init_ids:
-        if iid in _STAGE_SCOPE_IDS:
-            lifecycle_rank = min(lifecycle_rank, _LIFECYCLE_IDS.get(iid, 99))
-        else:
-            # This is the module name
-            name = _INITIATIVE_ID_TO_NAME.get(iid, "")
-            if name and name not in ("voa",):
-                module_name = name
+        name = _INITIATIVE_ID_TO_NAME.get(iid, "")
+        if name:
+            module_name = name
+            break
+
+    # Get phase rank from Phase field
+    phase_obj = idea["fields"].get(PHASE_FIELD) or {}
+    phase_id = phase_obj.get("id", "") if isinstance(phase_obj, dict) else ""
+    phase_rank = _PHASE_RANK.get(phase_id, 99)
 
     # Column rank for left→right ordering within a module
     col_id = (idea["fields"].get(ROADMAP_FIELD) or {}).get("id")
     col_rank = COLUMN_RANK.get(col_id, 999)
 
-    return (module_name or "zzz", lifecycle_rank, col_rank)
+    return (module_name or "zzz", phase_rank, col_rank)
 
 
 def organise_roadmap_ideas():
     """JOB 17: Organise ideas across the entire roadmap by initiative module.
     Uses GLOBAL ranking so same-module ideas align horizontally across columns.
-    Sort order: module group → lifecycle (Workflows→Modules→MVP→Iteration→Features) → column position."""
+    Sort order: module group → phase (MVP→Iteration) → column position."""
     log.info("JOB 17: Organising roadmap ideas by initiative lifecycle...")
 
     if not ROADMAP_COLUMNS:
         log.info("  JOB 17: No roadmap columns — skipping.")
         return
 
-    # Fetch ALL AR ideas (both swimlanes) with initiative data
+    # Fetch ALL AR ideas with initiative + phase data
     jql = f'project = {AR_PROJECT_KEY} AND status != Done'
-    fields = f"summary,{INITIATIVE_FIELD},{SWIMLANE_FIELD},{ROADMAP_FIELD}"
+    fields = f"summary,{INITIATIVE_FIELD},{SWIMLANE_FIELD},{ROADMAP_FIELD},{PHASE_FIELD}"
     all_ideas, start_at = [], 0
     while True:
         data = jira_get("/rest/api/3/search/jql", params={
@@ -1221,252 +1225,7 @@ Verify all split tickets pass their individual test plans.
         log.info(f"  Completed {key}.")
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# JOB 6: User Feedback Idea Processing (AR Strategic Roadmap)
-# ══════════════════════════════════════════════════════════════════════════════
 
-def get_user_feedback_ideas(unaligned_only=False):
-    """Fetch AR ideas in the 'User Feedback' swimlane.
-    If unaligned_only=True, only return ideas whose initiative is still VoA (not yet aligned to an SI)."""
-    jql = f'project = {AR_PROJECT_KEY} AND cf[10694] = "User Feedback" AND status != Done'
-    fields = f"summary,description,status,priority,labels,{ROADMAP_FIELD},{SWIMLANE_FIELD},{ADVISER_FIELD},{INITIATIVE_FIELD}"
-    issues, start_at = [], 0
-    while True:
-        data = jira_get("/rest/api/3/search/jql", params={"jql": jql, "fields": fields, "maxResults": 50, "startAt": start_at})
-        batch = data.get("issues", [])
-        total = data.get("total", 0)
-        issues.extend(batch)
-        if start_at + len(batch) >= total:
-            break
-        start_at += len(batch)
-
-    if unaligned_only:
-        voa_id = INITIATIVE_OPTIONS.get("voa")
-        result = []
-        for issue in issues:
-            initiatives = issue["fields"].get(INITIATIVE_FIELD) or []
-            init_ids = {i.get("id") for i in initiatives if isinstance(i, dict)}
-            # Still VoA-only or no initiative at all → needs alignment
-            if not init_ids or init_ids == {voa_id}:
-                result.append(issue)
-        return result
-    return issues
-
-
-def build_feedback_enrichment_prompt(issue):
-    """Build a prompt for Claude to clean up description for a user feedback idea."""
-    f = issue["fields"]
-    summary = f["summary"]
-    desc = f.get("description") or ""
-    if isinstance(desc, dict):
-        desc = adf_to_text(desc)
-
-    return f"""You are a senior Product Manager for Axis CRM, a life insurance distribution CRM platform.
-The platform is used by AFSL-licensed insurance advisers to manage clients, policies, applications, quotes, payments and commissions.
-Partner insurers include TAL, Zurich, AIA, MLC Life, MetLife, Resolution Life, Integrity Life and others.
-The CRM serves multiple divisions: LIP (lead intake & processing) team, services team, and advisers.
-
-You are processing a User Feedback idea ticket from the Strategic Roadmap.
-
-TICKET: {issue["key"]}
-CURRENT SUMMARY: {summary}
-RAW DESCRIPTION:
-{desc}
-
-You must do two things:
-
-1. CLEAN UP THE DESCRIPTION:
-   - The description contains verbatim user feedback quotes. Keep them verbatim — do NOT change the user's words.
-   - Format each quote as: 💬 [Name]: "[exact quote text]"
-   - Fix punctuation, add proper apostrophes, but don't rephrase their words.
-   - If the raw text is "Name: some feedback text", convert to: 💬 Name: "some feedback text"
-   - If already formatted with 💬 or 🗣, normalise to 💬 format.
-   - Separate each quote with a blank line.
-   - Preserve the adviser's name from each quote.
-
-RESPOND IN EXACTLY THIS JSON FORMAT (no markdown fences, no extra text):
-{{
-  "cleaned_description": "<formatted quotes with 💬 Name: \\"quote\\" format, each separated by blank lines>",
-  "adviser_names": ["<list of adviser names extracted from quotes>"]
-}}"""
-
-
-def update_ar_idea(issue_key, cleaned_desc=None):
-    """Update an AR idea with cleaned description."""
-    payload = {"fields": {}}
-
-    if cleaned_desc:
-        payload["update"] = {"description": [{"set": {"version": 1, "type": "doc", "content": markdown_to_adf(cleaned_desc)}}]}
-
-    if not payload["fields"]:
-        del payload["fields"]
-
-    ok, r = jira_put(f"/rest/api/3/issue/{issue_key}", payload)
-    if not ok:
-        log.warning(f"Failed to update {issue_key}: {r.status_code} {r.text[:300]}")
-    return ok
-
-
-def align_feedback_to_strategic():
-    """Align User Feedback ideas to their matching Strategic Initiative.
-    For each feedback idea still tagged VoA, Claude matches it to the best SI by content.
-    Then copies the SI's initiative values and roadmap column onto the feedback idea."""
-    if not ANTHROPIC_API_KEY:
-        log.info("  Feedback alignment skipped — ANTHROPIC_API_KEY not set.")
-        return
-
-    # Fetch all SI ideas as the reference catalog
-    si_ideas = get_strategic_ideas_scored()
-    if not si_ideas:
-        log.info("  No Strategic Initiative ideas found — skipping alignment.")
-        return
-
-    # Build catalog: key → {summary, initiative_ids, roadmap_col_id}
-    si_catalog = {}
-    si_summary_lines = []
-    for si in si_ideas:
-        f = si["fields"]
-        col_id = (f.get(ROADMAP_FIELD) or {}).get("id")
-        col_name = "Backlog"
-        for col in ROADMAP_COLUMNS:
-            if col["id"] == col_id:
-                col_name = col["value"]
-                break
-        if col_id == ROADMAP_BACKLOG_ID:
-            col_name = "Backlog"
-        init_values = f.get(INITIATIVE_FIELD) or []
-        si_catalog[si["key"]] = {
-            "summary": f["summary"],
-            "initiative_ids": [i["id"] for i in init_values if isinstance(i, dict)],
-            "roadmap_col_id": col_id,
-            "roadmap_col_name": col_name,
-        }
-        si_summary_lines.append(f"- {si['key']}: {f['summary']} [Column: {col_name}]")
-
-    si_catalog_text = "\n".join(si_summary_lines)
-
-    # Fetch unaligned feedback ideas (still VoA or no initiative)
-    feedback_ideas = get_user_feedback_ideas(unaligned_only=True)
-    if not feedback_ideas:
-        log.info("  All feedback ideas already aligned — nothing to do.")
-        return
-
-    log.info(f"  Aligning {len(feedback_ideas)} feedback idea(s) to Strategic Initiatives...")
-
-    aligned = 0
-    for fb in feedback_ideas:
-        fb_key = fb["key"]
-        fb_f = fb["fields"]
-        fb_summary = fb_f["summary"]
-        fb_desc = fb_f.get("description") or ""
-        if isinstance(fb_desc, dict):
-            fb_desc = adf_to_text(fb_desc)
-
-        prompt = f"""You are a Product Manager for Axis CRM, a life insurance distribution CRM platform.
-
-A User Feedback idea needs to be matched to the Strategic Initiative it most closely relates to.
-
-FEEDBACK IDEA:
-Key: {fb_key}
-Summary: {fb_summary}
-Description (quotes from advisers):
-{fb_desc[:2000]}
-
-STRATEGIC INITIATIVES CATALOG:
-{si_catalog_text}
-
-Which Strategic Initiative does this feedback idea best align with?
-Consider the topic, module, feature area, and user need described in the feedback.
-
-If NONE of the Strategic Initiatives are a reasonable match, respond with "NONE".
-
-RESPOND WITH ONLY the issue key (e.g. "AR-42") or "NONE". No explanation, no markdown."""
-
-        response = call_claude(prompt)
-        if not response:
-            log.warning(f"    {fb_key}: Claude matching failed — skipping.")
-            continue
-
-        matched_key = response.strip().upper()
-        if matched_key == "NONE" or matched_key not in si_catalog:
-            log.info(f"    {fb_key}: No matching SI found — leaving as VoA.")
-            continue
-
-        matched = si_catalog[matched_key]
-        update_fields = {}
-
-        # Copy initiative from SI
-        if matched["initiative_ids"]:
-            update_fields[INITIATIVE_FIELD] = [{"id": iid} for iid in matched["initiative_ids"]]
-
-        # Copy roadmap column from SI
-        if matched["roadmap_col_id"]:
-            current_col = (fb_f.get(ROADMAP_FIELD) or {}).get("id")
-            if current_col != matched["roadmap_col_id"]:
-                update_fields[ROADMAP_FIELD] = {"id": matched["roadmap_col_id"]}
-
-        if update_fields:
-            ok, resp = jira_put(f"/rest/api/3/issue/{fb_key}", {"fields": update_fields})
-            if ok:
-                init_names = ", ".join(
-                    k.title() for k, v in INITIATIVE_OPTIONS.items()
-                    if v in matched["initiative_ids"]
-                )
-                log.info(f"    {fb_key} → {matched_key} ({matched['summary'][:50]}) | Initiative: {init_names} | Column: {matched['roadmap_col_name']}")
-                aligned += 1
-            else:
-                log.warning(f"    {fb_key}: Failed to update: {resp.status_code}")
-        else:
-            log.info(f"    {fb_key} → {matched_key} (already aligned)")
-
-    log.info(f"  Feedback alignment complete: {aligned} idea(s) aligned.")
-
-
-def process_user_feedback():
-    """JOB 6: Process User Feedback ideas — clean descriptions, align to Strategic Initiatives."""
-    if not ANTHROPIC_API_KEY:
-        log.info("JOB 6 skipped — ANTHROPIC_API_KEY not set.")
-        return
-
-    # Step 1: Clean descriptions for unaligned feedback ideas
-    unaligned = get_user_feedback_ideas(unaligned_only=True)
-    if unaligned:
-        log.info(f"JOB 6: Found {len(unaligned)} unaligned User Feedback idea(s) to process.")
-        for issue in unaligned:
-            key = issue["key"]
-            summary = issue["fields"]["summary"]
-            log.info(f"  Processing {key}: {summary}")
-
-            prompt = build_feedback_enrichment_prompt(issue)
-            response = call_claude(prompt)
-
-            if not response:
-                log.warning(f"  Skipping {key} — Claude enrichment failed.")
-                continue
-
-            try:
-                clean = re.sub(r'^```(?:json)?\s*', '', response)
-                clean = re.sub(r'\s*```$', '', clean)
-                enrichment = json.loads(clean)
-            except json.JSONDecodeError as e:
-                log.warning(f"  Skipping {key} — JSON parse error: {e}")
-                continue
-
-            cleaned_desc = enrichment.get("cleaned_description")
-
-            if update_ar_idea(key, cleaned_desc=cleaned_desc):
-                log.info(f"  Completed {key}: description cleaned")
-            else:
-                log.warning(f"  Failed to update {key}")
-    else:
-        log.info("JOB 6: All feedback ideas already processed.")
-
-    # Step 2: Align feedback ideas to Strategic Initiatives (initiative + roadmap column)
-    log.info("JOB 6: Aligning User Feedback ideas to Strategic Initiatives.")
-    align_feedback_to_strategic()
-
-
-# ══════════════════════════════════════════════════════════════════════════════
 # JOB 7: Telegram Bot — Create JPD Ideas from Voice/Text
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -1489,26 +1248,10 @@ def send_telegram(msg, parse_mode="Markdown"):
         log.error(f"Telegram send error: {e}")
     return False
 
-def build_idea_extraction_prompt(user_text, swimlane_id=None):
+def build_idea_extraction_prompt(user_text):
     """Build the Claude prompt to structure a Telegram message into a JPD idea."""
-    is_feedback = (swimlane_id == USER_FEEDBACK_OPTION_ID)
     product_cats = ", ".join(f'"{k.title()}"' for k in PRODUCT_CATEGORY_OPTIONS)
-
-    if is_feedback:
-        # Feedback ideas only need VoA initiative — no module/stage/scope
-        initiative_instructions = """- INITIATIVE: For User Feedback ideas, this is always just "VoA". Do NOT include initiative_module, initiative_stage, or initiative_scope."""
-        initiative_json = ""
-        labels_rule = '- LABELS: Must be either "Modules" or "Features" — pick the one that best fits the idea.'
-    else:
-        initiative_modules = ", ".join(f'"{k.title()}"' for k in INITIATIVE_OPTIONS if k not in ("mvp", "iteration", "modules", "workflows", "features"))
-        initiative_instructions = f"""- INITIATIVE must always have exactly 3 values:
-  1. initiative_module: The primary module or feature. Select ONE from: {initiative_modules}
-  2. initiative_stage: Either "MVP" (new capability) or "Iteration" (improving existing). Pick based on context.
-  3. initiative_scope: Either "Modules" (if it's a full module/screen) or "Features" (if it's a feature within a module)."""
-        initiative_json = """  "initiative_module": "[Primary module/feature — select ONE from the list below]",
-  "initiative_stage": "[MVP or Iteration]",
-  "initiative_scope": "[Modules or Features]","""
-        labels_rule = '- LABELS: Must be either "Modules" or "Features" — match whichever you picked for initiative_scope.'
+    initiative_modules = ", ".join(f'"{k.title()}"' for k in INITIATIVE_OPTIONS)
 
     return f"""You are a senior Product Manager for Axis CRM, a life insurance distribution CRM platform.
 The platform is used by AFSL-licensed insurance advisers to manage clients, policies, applications, quotes, payments and commissions.
@@ -1525,8 +1268,9 @@ Respond with ONLY a JSON object (no markdown, no backticks, no explanation):
 {{
   "summary": "Concise idea title (3-8 words)",
   "description": "**Outcome we want to achieve**\\n\\n[Clear, specific outcome with measurable targets where possible.]\\n\\n**Why it's a problem**\\n\\n[Current pain point, inefficiency, or gap. Include evidence where available.]\\n\\n**How it gets us closer to our vision: The Adviser CRM that enables workflow and pipeline visibility, client engagement and compliance through intelligent automation.**\\n\\n[Connect to vision — workflow/pipeline visibility, client engagement, compliance, or intelligent automation.]\\n\\n**How it improves our north star: Total submissions**\\n\\n[Specific causal chain explaining how this increases total submissions.]",
-  {initiative_json}
-  "labels": "[Modules or Features]",
+  "swimlane": "[Experience, Capability, or Other]",
+  "initiative": "[Primary module — select ONE from: {initiative_modules}]",
+  "phase": "[MVP or Iteration]",
   "product_category": "[One of: {product_cats}, or null]",
   "discovery": "Validate"
 }}
@@ -1534,18 +1278,25 @@ Respond with ONLY a JSON object (no markdown, no backticks, no explanation):
 RULES:
 - Write the description as a thoughtful PM would — substantive, not just parroting the input.
 - The four description sections are MANDATORY. Fill them all in based on the context.
-{initiative_instructions}
-{labels_rule}
+- swimlane: "Experience" = adviser-facing screens, dashboards, forms, UI flows. "Capability" = backend automation, integrations, data pipelines, APIs, system infrastructure. "Other" = anything that doesn't clearly fit.
+- initiative must be ONE value from the list. Pick the closest match.
+- phase: "MVP" = building something new that doesn't exist yet. "Iteration" = improving or extending something already in the platform.
 - ROADMAP: Do NOT include a roadmap_column field. All new ideas go to Backlog automatically.
 - discovery should default to "Validate" unless the user says otherwise."""
 
 
-def create_jpd_idea(structured_data, swimlane_id=None):
+def create_jpd_idea(structured_data):
     """Create a JPD idea in Jira from structured data extracted by Claude."""
-    if swimlane_id is None:
-        swimlane_id = STRATEGIC_INITIATIVES_ID
     summary = structured_data.get("summary", "Untitled idea")
     description_md = structured_data.get("description", "")
+
+    # Resolve swimlane
+    swimlane_name = structured_data.get("swimlane", "experience").lower()
+    swimlane_id = SWIMLANE_OPTIONS.get(swimlane_name, EXPERIENCE_SWIMLANE_ID)
+
+    # Resolve phase
+    phase_name = structured_data.get("phase", "").lower()
+    phase_id = PHASE_MVP_ID if phase_name == "mvp" else PHASE_ITERATION_ID if phase_name == "iteration" else None
 
     # Build the fields payload
     fields = {
@@ -1560,29 +1311,16 @@ def create_jpd_idea(structured_data, swimlane_id=None):
     # Roadmap — always Backlog
     fields[ROADMAP_FIELD] = {"id": ROADMAP_BACKLOG_ID}
 
-    # Initiative — Strategic: 3 values [module, stage, scope]; Feedback: just VoA
-    if swimlane_id == USER_FEEDBACK_OPTION_ID:
-        voa_id = INITIATIVE_OPTIONS.get("voa")
-        if voa_id:
-            fields[INITIATIVE_FIELD] = [{"id": voa_id}]
-    else:
-        init_ids = []
-        for key in ("initiative_module", "initiative_stage", "initiative_scope"):
-            name = structured_data.get(key, "")
-            if name:
-                option_id = INITIATIVE_OPTIONS.get(name.lower())
-                if option_id:
-                    init_ids.append({"id": option_id})
-        if init_ids:
-            fields[INITIATIVE_FIELD] = init_ids
+    # Phase (separate select field)
+    if phase_id:
+        fields[PHASE_FIELD] = {"id": phase_id}
 
-    # Labels — only "Modules" or "Features"
-    label = structured_data.get("labels", "Features")
-    if isinstance(label, list):
-        label = label[0] if label else "Features"
-    if label not in ("Modules", "Features"):
-        label = "Features"
-    fields[LABELS_FIELD] = [label]
+    # Initiative (module only)
+    init_name = structured_data.get("initiative", "")
+    if init_name:
+        option_id = INITIATIVE_OPTIONS.get(init_name.lower())
+        if option_id:
+            fields[INITIATIVE_FIELD] = [{"id": option_id}]
 
     # Product category
     prod_cat = structured_data.get("product_category")
@@ -1640,10 +1378,8 @@ def transcribe_voice(file_path):
                 pass
 
 
-def process_telegram_idea(user_text, chat_id, bot, swimlane_id=None):
+def process_telegram_idea(user_text, chat_id, bot):
     """Full pipeline: text → Claude structuring → Jira creation → Telegram reply."""
-    if swimlane_id is None:
-        swimlane_id = STRATEGIC_INITIATIVES_ID
     if not user_text or not user_text.strip():
         bot.send_message(chat_id, "❌ Couldn't understand the message. Please try again.")
         return
@@ -1651,7 +1387,7 @@ def process_telegram_idea(user_text, chat_id, bot, swimlane_id=None):
     bot.send_message(chat_id, "🧠 Structuring your idea...")
 
     # Call Claude to structure the idea
-    prompt = build_idea_extraction_prompt(user_text, swimlane_id=swimlane_id)
+    prompt = build_idea_extraction_prompt(user_text)
     response = call_claude(prompt, max_tokens=2048)
     if not response:
         bot.send_message(chat_id, "❌ Failed to process with AI. Check the Anthropic API key.")
@@ -1668,25 +1404,18 @@ def process_telegram_idea(user_text, chat_id, bot, swimlane_id=None):
         return
 
     # Create the Jira idea
-    issue_key = create_jpd_idea(structured, swimlane_id=swimlane_id)
+    issue_key = create_jpd_idea(structured)
     if issue_key:
         summary = structured.get("summary", "Untitled")
+        swimlane = structured.get("swimlane", "Experience")
+        initiative = structured.get("initiative", "?")
+        phase = structured.get("phase", "?")
 
         link = f"https://axiscrm.atlassian.net/jira/polaris/projects/AR/ideas/view/11184018?selectedIssue={issue_key}"
-        lane_name = "User Feedback" if swimlane_id == USER_FEEDBACK_OPTION_ID else "Strategic Initiatives"
-
-        if swimlane_id == USER_FEEDBACK_OPTION_ID:
-            initiative_line = "🏷 VoA"
-        else:
-            init_module = structured.get("initiative_module", "?")
-            init_stage = structured.get("initiative_stage", "?")
-            init_scope = structured.get("initiative_scope", "?")
-            initiative_line = f"🏷 {init_module} · {init_stage} · {init_scope}"
 
         msg = (
             f"✅ *{issue_key}* — {summary}\n\n"
-            f"🏊 {lane_name}\n"
-            f"{initiative_line}\n\n"
+            f"🏊 {swimlane} · 🏷 {initiative} · 📦 {phase}\n\n"
             f"[Open on board]({link})"
         )
         bot.send_message(chat_id, msg, parse_mode="Markdown", disable_web_page_preview=True)
@@ -1721,8 +1450,7 @@ def start_telegram_bot():
         save_chat_id(message.chat.id)
         bot.reply_to(message,
             "👋 *Alfred — Axis CRM Bot*\n\n"
-            "*🧠 /strategic* — Create idea → Strategic Initiatives swimlane\n"
-            "*💬 /feedback* — Create idea → User Feedback swimlane\n"
+            "*🧠 /strategic* — Create idea on the roadmap\n"
             "*🔨 /backlog* — Create Epic + broken-down tickets in Sprints\n"
             "*✏️ /update* — Edit an existing ticket (summary, description, fields)\n"
             "*➕ /add* — Create tickets under an existing epic\n"
@@ -1735,19 +1463,13 @@ def start_telegram_bot():
     @bot.message_handler(commands=["strategic"])
     def handle_strategic(message):
         save_chat_id(message.chat.id)
-        user_mode[message.chat.id] = {"mode": "roadmap", "swimlane": STRATEGIC_INITIATIVES_ID}
-        bot.reply_to(message, "🧠 *Strategic Initiatives* — send your idea.", parse_mode="Markdown")
-
-    @bot.message_handler(commands=["feedback"])
-    def handle_feedback(message):
-        save_chat_id(message.chat.id)
-        user_mode[message.chat.id] = {"mode": "roadmap", "swimlane": USER_FEEDBACK_OPTION_ID}
-        bot.reply_to(message, "💬 *User Feedback* — send your idea.", parse_mode="Markdown")
+        user_mode[message.chat.id] = {"mode": "roadmap"}
+        bot.reply_to(message, "🧠 *Roadmap idea* — send your idea. Claude will pick swimlane, initiative & phase.", parse_mode="Markdown")
 
     @bot.message_handler(commands=["backlog"])
     def handle_backlog_mode(message):
         save_chat_id(message.chat.id)
-        user_mode[message.chat.id] = {"mode": "backlog", "swimlane": STRATEGIC_INITIATIVES_ID}
+        user_mode[message.chat.id] = {"mode": "backlog"}
         bot.reply_to(message, "🔨 *Backlog mode* — describe what needs building.", parse_mode="Markdown")
 
     @bot.message_handler(commands=["update"])
@@ -1855,13 +1577,13 @@ def start_telegram_bot():
         state = user_mode.get(message.chat.id, {})
         mode = state.get("mode")
         if mode == "weekly":
-            user_mode[message.chat.id] = {"mode": "roadmap", "swimlane": STRATEGIC_INITIATIVES_ID}
+            user_mode[message.chat.id] = {"mode": "roadmap"}
             bot.reply_to(message, "✅ Product Weekly session finished.", parse_mode="Markdown")
         elif mode == "update":
-            user_mode[message.chat.id] = {"mode": "roadmap", "swimlane": STRATEGIC_INITIATIVES_ID}
+            user_mode[message.chat.id] = {"mode": "roadmap"}
             bot.reply_to(message, "✅ Update mode finished.", parse_mode="Markdown")
         elif mode == "add":
-            user_mode[message.chat.id] = {"mode": "roadmap", "swimlane": STRATEGIC_INITIATIVES_ID}
+            user_mode[message.chat.id] = {"mode": "roadmap"}
             bot.reply_to(message, "✅ Add mode finished.", parse_mode="Markdown")
         else:
             bot.reply_to(message, "Nothing to finish. Use /help for commands.")
@@ -1880,7 +1602,7 @@ def start_telegram_bot():
             text = transcribe_voice(tmp_path)
             if text:
                 bot.send_message(message.chat.id, f"📝 Heard: _{text}_", parse_mode="Markdown")
-                state = user_mode.get(message.chat.id, {"mode": "roadmap", "swimlane": STRATEGIC_INITIATIVES_ID})
+                state = user_mode.get(message.chat.id, {"mode": "roadmap"})
                 if state.get("mode") == "weekly":
                     # Treat voice as a callout in weekly mode
                     page_id = state.get("page_id")
@@ -1908,7 +1630,7 @@ def start_telegram_bot():
                 elif state["mode"] == "backlog":
                     process_telegram_work(text, message.chat.id, bot)
                 else:
-                    process_telegram_idea(text, message.chat.id, bot, swimlane_id=state["swimlane"])
+                    process_telegram_idea(text, message.chat.id, bot)
             else:
                 bot.send_message(message.chat.id, "❌ Couldn't transcribe the voice note. Try sending it as text instead.")
         except Exception as e:
@@ -1919,9 +1641,9 @@ def start_telegram_bot():
     def handle_text(message):
         save_chat_id(message.chat.id)
         if message.text.startswith("/"):
-            bot.reply_to(message, "Unknown command. Try /strategic, /feedback, /backlog, /update, /add, /productweekly, or /help")
+            bot.reply_to(message, "Unknown command. Try /strategic, /backlog, /update, /add, /productweekly, or /help")
             return
-        state = user_mode.get(message.chat.id, {"mode": "roadmap", "swimlane": STRATEGIC_INITIATIVES_ID})
+        state = user_mode.get(message.chat.id, {"mode": "roadmap"})
 
         if state.get("mode") == "weekly":
             page_id = state.get("page_id")
@@ -1973,7 +1695,7 @@ def start_telegram_bot():
         elif state["mode"] == "backlog":
             process_telegram_work(message.text, message.chat.id, bot)
         else:
-            process_telegram_idea(message.text, message.chat.id, bot, swimlane_id=state["swimlane"])
+            process_telegram_idea(message.text, message.chat.id, bot)
 
     log.info("JOB 7: Telegram bot starting (polling)...")
     try:
@@ -4098,9 +3820,6 @@ def run():
 
         log.info("JOB 5: Enrich Ticket Descriptions")
         enrich_ticket_descriptions()
-
-        log.info("JOB 6: Process User Feedback Ideas")
-        process_user_feedback()
 
         log.info("JOB 11: Board Monitor")
         run_board_monitor()
