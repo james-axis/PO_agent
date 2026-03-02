@@ -646,31 +646,111 @@ def ensure_sprint_runway(future_sprints, required=8):
 
 # ── ADF conversion ────────────────────────────────────────────────────────────
 
-def markdown_to_adf(md_text):
-    content = []
-    for line in md_text.split("\n"):
-        line = line.rstrip()
-        if not line:
-            continue
-        nodes = parse_inline_marks(line)
-        content.append({"type": "paragraph", "content": nodes})
-    return content
+def _parse_inline_markdown(text):
+    """Parse inline markdown (bold, italic, links) into ADF text nodes with marks."""
+    if not text:
+        return [{"type": "text", "text": " "}]
 
-def parse_inline_marks(text):
-    nodes = []
-    pattern = r'(\*\*(.+?)\*\*|\[(.+?)\]\((.+?)\)|[^*\[]+)'
+    result = []
+    # Pattern: **bold**, *bold*, [link](url), or plain text
+    pattern = r'(\*\*(.+?)\*\*|\*([^*\s][^*]*?)\*|\[(.+?)\]\((.+?)\)|[^*\[]+)'
+    pos = 0
     for m in re.finditer(pattern, text):
         if m.group(2):
-            nodes.append({"type": "text", "text": m.group(2), "marks": [{"type": "strong"}]})
-        elif m.group(3) and m.group(4):
-            nodes.append({"type": "text", "text": m.group(3), "marks": [{"type": "link", "attrs": {"href": m.group(4)}}]})
+            # **bold**
+            result.append({"type": "text", "text": m.group(2), "marks": [{"type": "strong"}]})
+        elif m.group(3):
+            # *bold* (single asterisk)
+            result.append({"type": "text", "text": m.group(3), "marks": [{"type": "strong"}]})
+        elif m.group(4) and m.group(5):
+            # [link](url)
+            result.append({"type": "text", "text": m.group(4), "marks": [{"type": "link", "attrs": {"href": m.group(5)}}]})
         else:
             txt = m.group(0)
             if txt.strip():
-                nodes.append({"type": "text", "text": txt})
-    if not nodes:
-        nodes.append({"type": "text", "text": text})
-    return nodes
+                result.append({"type": "text", "text": txt})
+        pos = m.end()
+
+    return result if result else [{"type": "text", "text": text}]
+
+
+def markdown_to_adf(md_text):
+    """Convert markdown text to ADF content nodes with proper inline formatting."""
+    if not md_text:
+        return [{"type": "paragraph", "content": [{"type": "text", "text": " "}]}]
+
+    nodes = []
+    for line in md_text.split("\n"):
+        stripped = line.rstrip()
+        if not stripped.strip():
+            continue
+
+        s = stripped.strip()
+
+        # Headings: ### text, ## text, # text
+        if s.startswith("### "):
+            nodes.append({
+                "type": "heading", "attrs": {"level": 3},
+                "content": _parse_inline_markdown(s[4:])
+            })
+        elif s.startswith("## "):
+            nodes.append({
+                "type": "heading", "attrs": {"level": 2},
+                "content": _parse_inline_markdown(s[3:])
+            })
+        elif s.startswith("# "):
+            nodes.append({
+                "type": "heading", "attrs": {"level": 1},
+                "content": _parse_inline_markdown(s[2:])
+            })
+        # Bullet items: - text or * text (but not **bold**)
+        elif s.startswith("- ") or (s.startswith("* ") and not s.startswith("**")):
+            item_text = s[2:]
+            item_content = _parse_inline_markdown(item_text)
+            if nodes and nodes[-1].get("type") == "bulletList":
+                nodes[-1]["content"].append({
+                    "type": "listItem",
+                    "content": [{"type": "paragraph", "content": item_content}]
+                })
+            else:
+                nodes.append({
+                    "type": "bulletList",
+                    "content": [{
+                        "type": "listItem",
+                        "content": [{"type": "paragraph", "content": item_content}]
+                    }]
+                })
+        # Numbered list: 1. text, 2. text
+        elif len(s) > 2 and s[0].isdigit() and '. ' in s[:5]:
+            dot_pos = s.index('. ')
+            item_text = s[dot_pos+2:]
+            item_content = _parse_inline_markdown(item_text)
+            if nodes and nodes[-1].get("type") == "orderedList":
+                nodes[-1]["content"].append({
+                    "type": "listItem",
+                    "content": [{"type": "paragraph", "content": item_content}]
+                })
+            else:
+                nodes.append({
+                    "type": "orderedList",
+                    "content": [{
+                        "type": "listItem",
+                        "content": [{"type": "paragraph", "content": item_content}]
+                    }]
+                })
+        else:
+            # Regular paragraph with inline formatting
+            nodes.append({
+                "type": "paragraph",
+                "content": _parse_inline_markdown(s)
+            })
+
+    return nodes or [{"type": "paragraph", "content": [{"type": "text", "text": " "}]}]
+
+
+def parse_inline_marks(text):
+    """Legacy wrapper — redirects to _parse_inline_markdown."""
+    return _parse_inline_markdown(text)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # JOB 5: AI-Powered Ticket Enrichment
