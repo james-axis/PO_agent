@@ -1,6 +1,7 @@
 import os
 import re
 import json
+import random
 import requests
 import logging
 from datetime import datetime, timedelta
@@ -26,6 +27,14 @@ PRIORITY_ORDER     = {"Highest": 1, "High": 2, "Medium": 3, "Low": 4, "Lowest": 
 COMPLETED_STATUSES = {"done", "released"}
 STORY_POINTS_FIELD = "customfield_10016"
 REVIEWED_FIELD     = None  # Auto-discovered at startup
+ISSUE_COLOR_FIELD  = "customfield_10017"
+
+# Epic color palette (matches Jira's color picker)
+EPIC_COLORS = [
+    "purple", "dark_blue", "teal", "green", "yellow",
+    "blue", "dark_teal", "dark_green", "orange", "blue_gray",
+    "dark_purple", "dark_orange", "red", "dark_gray",
+]
 
 # ── AR (Strategic Roadmap / JPD) Config ───────────────────────────────────────
 AR_PROJECT_KEY     = "AR"
@@ -1940,6 +1949,10 @@ def create_ax_ticket(ticket_data, issue_type, parent_key=None):
     if parent_key and issue_type != "Epic":
         fields["parent"] = {"key": parent_key}
 
+    # Epic color
+    if issue_type == "Epic":
+        fields[ISSUE_COLOR_FIELD] = random.choice(EPIC_COLORS)
+
     # Story points (not for Epics)
     if story_points and issue_type != "Epic":
         fields[STORY_POINTS_FIELD] = float(story_points)
@@ -3208,6 +3221,7 @@ def process_strategic_pipeline():
             "description": {"version": 1, "type": "doc", "content": markdown_to_adf(epic_desc_md)},
             "assignee": {"accountId": ANDREJ_ID},
             "priority": {"name": epic_data.get("priority", "Medium")},
+            ISSUE_COLOR_FIELD: random.choice(EPIC_COLORS),
         }
 
         ok, resp = jira_post("/rest/api/3/issue", {"fields": epic_fields})
