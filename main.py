@@ -1524,7 +1524,7 @@ def start_telegram_bot():
             "👋 *Alfred — Axis CRM Bot*\n\n"
             "*🧠 /strategic* — Create idea on the roadmap\n"
             "*🔨 /backlog* — Create Epic + broken-down tickets in Sprints\n"
-            "*✏️ /update* — Edit ticket, move sprint/backlog, trigger PM5/PM7\n"
+            "*✏️ /update* — Edit an existing ticket (summary, description, fields)\n"
             "*➕ /add* — Create tickets under an existing epic\n"
             "*📋 /productweekly* — Review actions & add callouts to weekly meeting\n\n"
             "Send a text or voice note after selecting a mode.\n"
@@ -1549,17 +1549,12 @@ def start_telegram_bot():
         save_chat_id(message.chat.id)
         user_mode[message.chat.id] = {"mode": "update"}
         bot.reply_to(message,
-            "✏️ *Update mode* — send a ticket ID first, then actions.\n\n"
-            "*PO actions:*\n"
-            "• `April (S1)` — move to sprint\n"
-            "• `backlog` — move to backlog\n"
-            "• `pm5` — generate task breakdown (Epics)\n"
-            "• `pm7` — schedule sprint from AR roadmap\n\n"
-            "*Edit actions:*\n"
-            "• `change AC to include admin validation`\n"
-            "• `set story points to 2`\n"
-            "• `update summary to Campaign Dashboard`\n\n"
-            "Send ticket ID (e.g. `AX-426`) to start.",
+            "✏️ *Update mode* — send the ticket ID and what to change.\n\n"
+            "Examples:\n"
+            "• `AX-123 change acceptance criteria to include admin validation`\n"
+            "• `AX-456 set story points to 2`\n"
+            "• `AR-78 update summary to Campaign ROI Dashboard`\n\n"
+            "Or just send the ticket ID first, then the changes.",
             parse_mode="Markdown")
 
     @bot.message_handler(commands=["add"])
@@ -1980,465 +1975,26 @@ RULES:
 - Be concise in all content."""
 
 
-# ── PO: Action Detection for /update ────────────────────────────────────────
-
-MONTH_MAP = {
-    "january": 1, "february": 2, "march": 3, "april": 4,
-    "may": 5, "june": 6, "july": 7, "august": 8,
-    "september": 9, "october": 10, "november": 11, "december": 12,
-}
-
-
-def detect_update_action(instruction):
-    """Detect if instruction is a direct action (sprint move, backlog, PM trigger).
-    Returns (action_type, param) or (None, None)."""
-    lower = instruction.lower().strip()
-
-    # Backlog move
-    if lower in ("backlog", "move to backlog", "send to backlog"):
-        return ("backlog", None)
-
-    # PM5: task breakdown
-    if lower in ("pm5", "task breakdown", "break down", "breakdown", "break it down"):
-        return ("pm5", None)
-
-    # PM7: schedule sprint from AR roadmap (just "pm7" alone)
-    if lower == "pm7":
-        return ("pm7", None)
-
-    # Sprint move: "move to sprint April (S1)" or "April (S1)" or "pm7 April (S1)"
-    sprint_match = re.search(r'(?:move to sprint|move to|sprint|pm7)\s+(\w+\s*\(S\d+\))', instruction, re.IGNORECASE)
-    if not sprint_match:
-        sprint_match = re.match(r'^(\w+\s*\(S\d+\))$', instruction.strip(), re.IGNORECASE)
-    if sprint_match:
-        return ("sprint", sprint_match.group(1).strip())
-
-    return (None, None)
-
-
-def find_sprint_by_label(label):
-    """Find a sprint matching a label like 'April (S1)'.
-    Returns sprint dict or None."""
-    match = re.match(r'^(\w+)\s*\(S(\d+)\)$', label.strip(), re.IGNORECASE)
-    if not match:
-        return None
-    month_name = match.group(1).lower()
-    sprint_idx = int(match.group(2)) - 1  # 0-indexed
-    target_month = MONTH_MAP.get(month_name)
-    if target_month is None:
-        return None
-
-    now = datetime.now()
-    target_year = now.year
-    if target_month < now.month:
-        target_year += 1
-
-    all_sprints = []
-    for st in ("active", "future"):
-        data = jira_get(f"/rest/agile/1.0/board/{BOARD_ID}/sprint?state={st}")
-        all_sprints.extend(data.get("values", []))
-
-    month_sprints = []
-    for s in all_sprints:
-        sd = s.get("startDate", "")
-        if not sd:
-            continue
-        try:
-            dt = datetime.fromisoformat(sd.replace("Z", "+00:00"))
-            if dt.month == target_month and dt.year == target_year:
-                month_sprints.append(s)
-        except Exception:
-            continue
-
-    month_sprints.sort(key=lambda s: s.get("startDate", ""))
-    if sprint_idx < len(month_sprints):
-        return month_sprints[sprint_idx]
-    return None
-
-
-def get_epic_children(epic_key):
-    """Get all non-Done child issues under an Epic."""
-    issues = jira_get("/rest/api/3/search/jql", params={
-        "jql": f'"Epic Link" = {epic_key} AND status not in (Done, Released)',
-        "fields": "summary,status",
-        "maxResults": 100,
-    })
-    return issues.get("issues", []) if issues else []
-
-
-def handle_sprint_move(ticket_key, sprint_label, chat_id, bot):
-    """Move a ticket (+ children if Epic) to a named sprint."""
-    sprint = find_sprint_by_label(sprint_label)
-    if not sprint:
-        bot.send_message(chat_id, f"❌ No sprint found matching '{sprint_label}'. Check the name (e.g. April (S1)).")
-        return
-
-    sprint_id = sprint["id"]
-    sprint_name = sprint.get("name", str(sprint_id))
-
-    # Check if Epic — move children too
-    issue = jira_get(f"/rest/api/3/issue/{ticket_key}", params={"fields": "issuetype"})
-    is_epic = issue and issue.get("fields", {}).get("issuetype", {}).get("name") == "Epic"
-
-    keys_to_move = [ticket_key]
-    if is_epic:
-        children = get_epic_children(ticket_key)
-        keys_to_move.extend(c["key"] for c in children)
-
-    moved = 0
-    for key in keys_to_move:
-        if move_issue_to_sprint(key, sprint_id):
-            moved += 1
-
-    link = f"https://axiscrm.atlassian.net/browse/{ticket_key}"
-    bot.send_message(chat_id,
-        f"📅 [{ticket_key}]({link}) → *{sprint_name}*\n"
-        f"Moved {moved}/{len(keys_to_move)} issues"
-        + (f" (epic + {len(keys_to_move)-1} children)" if is_epic and len(keys_to_move) > 1 else "")
-        + "\n\nSend another ticket ID, or /done to exit.",
-        parse_mode="Markdown", disable_web_page_preview=True)
-    log.info(f"PO /update: Moved {ticket_key} + {len(keys_to_move)-1} children to '{sprint_name}'")
-
-
-def handle_backlog_move(ticket_key, chat_id, bot):
-    """Move a ticket (+ children if Epic) to backlog."""
-    issue = jira_get(f"/rest/api/3/issue/{ticket_key}", params={"fields": "issuetype"})
-    is_epic = issue and issue.get("fields", {}).get("issuetype", {}).get("name") == "Epic"
-
-    keys_to_move = [ticket_key]
-    if is_epic:
-        children = get_epic_children(ticket_key)
-        keys_to_move.extend(c["key"] for c in children)
-
-    ok, _ = jira_post("/rest/agile/1.0/backlog/issue", {"issues": keys_to_move})
-
-    link = f"https://axiscrm.atlassian.net/browse/{ticket_key}"
-    if ok:
-        bot.send_message(chat_id,
-            f"📋 [{ticket_key}]({link}) → *Backlog*"
-            + (f" ({len(keys_to_move)} issues)" if len(keys_to_move) > 1 else "")
-            + "\n\nSend another ticket ID, or /done to exit.",
-            parse_mode="Markdown", disable_web_page_preview=True)
-    else:
-        bot.send_message(chat_id, f"❌ Failed to move {ticket_key} to backlog.")
-    log.info(f"PO /update: Moved {ticket_key} to backlog (ok={ok})")
-
-
-def handle_pm5_trigger(ticket_key, chat_id, bot, state, user_mode):
-    """Generate task breakdown for an Epic and show preview for approval."""
-    # Verify it's an Epic
-    issue = jira_get(f"/rest/api/3/issue/{ticket_key}", params={
-        "fields": "summary,issuetype,description"
-    })
-    if not issue:
-        bot.send_message(chat_id, f"❌ Couldn't find {ticket_key}.")
-        return
-    itype = issue.get("fields", {}).get("issuetype", {}).get("name", "")
-    if itype != "Epic":
-        bot.send_message(chat_id, f"❌ PM5 only works on Epics. {ticket_key} is a {itype}.")
-        return
-
-    epic_title = issue["fields"].get("summary", "")
-    desc_adf = issue["fields"].get("description") or {}
-    desc_text = adf_to_text(desc_adf) if isinstance(desc_adf, dict) else str(desc_adf)
-
-    # Find PRD link in description
-    status_msg = bot.send_message(chat_id, f"📝 Finding PRD for {ticket_key}...")
-    prd_content = ""
-    prd_urls = re.findall(r'https?://axiscrm\.atlassian\.net/wiki/\S+', desc_text)
-    for url in prd_urls:
-        m = re.search(r'/pages/(\d+)', url)
-        if m and m.group(1) != "91062273":  # Skip DoR/DoD page
-            try:
-                r = requests.get(f"{CONFLUENCE_BASE}/api/v2/pages/{m.group(1)}?body-format=atlas_doc_format",
-                                 auth=auth, headers=headers, timeout=10)
-                if r.status_code == 200:
-                    page = r.json()
-                    body_val = page.get("body", {}).get("atlas_doc_format", {}).get("value", "")
-                    if body_val:
-                        prd_content = adf_to_text(json.loads(body_val)) if isinstance(body_val, str) else adf_to_text(body_val)
-                        break
-            except Exception as e:
-                log.warning(f"PM5: Failed to fetch Confluence page: {e}")
-
-    if not prd_content:
-        try:
-            bot.delete_message(chat_id, status_msg.message_id)
-        except Exception:
-            pass
-        bot.send_message(chat_id, f"❌ No PRD found in {ticket_key}'s description. Add a Confluence PRD link first.")
-        return
-
-    # Generate task breakdown
-    bot.edit_message_text("📝 Generating task breakdown...", chat_id, status_msg.message_id)
-
-    sp_scale = "SP Scale: 0.25 (30min), 0.5 (1hr), 1 (2hr), 2 (4hr), 3 (6hr max)"
-    prompt = (
-        f"Break this Epic into small, shippable tasks.\n\n"
-        f"**Epic:** {ticket_key} - {epic_title}\n\n"
-        f"<prd>\n{prd_content[:8000]}\n</prd>\n\n"
-        f"{sp_scale}\n\n"
-        "JSON only:\n"
-        "[\n"
-        "  {\n"
-        '    "summary": "Short title (max 8 words)",\n'
-        '    "task_summary": "One sentence: what this delivers",\n'
-        '    "user_story": "As a [role], I want [action] so that [benefit]",\n'
-        '    "acceptance_criteria": ["Short AC (max 10 words each)"],\n'
-        '    "test_plan": "One sentence",\n'
-        '    "story_points": 1.0\n'
-        "  }\n"
-        "]\n\n"
-        "RULES:\n"
-        "- 8-15 tasks. Vertical slices. Order by dependency.\n"
-        "- task_summary: ONE sentence, max 15 words.\n"
-        "- acceptance_criteria: 2-3 items, max 10 words each.\n"
-        "- test_plan: ONE sentence.\n"
-        "- No filler words. Just state the requirement."
-    )
-
-    response = call_claude(prompt, max_tokens=6000)
-    try:
-        bot.delete_message(chat_id, status_msg.message_id)
-    except Exception:
-        pass
-
-    if not response:
-        bot.send_message(chat_id, "❌ AI failed to generate tasks.")
-        return
-
-    try:
-        clean = re.sub(r'^```(?:json)?\s*', '', response)
-        clean = re.sub(r'\s*```$', '', clean)
-        tasks = json.loads(clean)
-    except json.JSONDecodeError:
-        bot.send_message(chat_id, "❌ Failed to parse task breakdown.")
-        return
-
-    if not tasks or not isinstance(tasks, list):
-        bot.send_message(chat_id, "❌ Empty task breakdown returned.")
-        return
-
-    total_sp = sum(t.get("story_points", 0) for t in tasks)
-
-    # Show preview
-    lines = [f"📝 *{ticket_key} — Task Breakdown* ({len(tasks)} tasks, {total_sp} SP)\n"]
-    for i, t in enumerate(tasks, 1):
-        sp = t.get("story_points", "?")
-        lines.append(f"{i}. {t.get('summary', '?')} ({sp} SP)")
-    lines.append(f"\n✅ Send *approve* to create all tasks")
-    lines.append(f"🔄 Or describe changes (e.g. 'split task 3')")
-    lines.append(f"⛔ Send *cancel* to abort")
-
-    bot.send_message(chat_id, "\n".join(lines), parse_mode="Markdown")
-
-    # Store in state for approval
-    state["pm5_pending"] = {
-        "tasks": tasks,
-        "epic_key": ticket_key,
-        "epic_title": epic_title,
-        "prd_content": prd_content,
-        "total_sp": total_sp,
-    }
-    user_mode[chat_id] = state
-    log.info(f"PO PM5: Generated {len(tasks)} tasks for {ticket_key} ({total_sp} SP) — awaiting approval")
-
-
-def handle_pm5_approval(chat_id, bot, state, user_mode):
-    """Create tasks from an approved PM5 breakdown."""
-    pm5 = state.get("pm5_pending")
-    if not pm5:
-        return
-    epic_key = pm5["epic_key"]
-    tasks = pm5["tasks"]
-
-    status_msg = bot.send_message(chat_id, f"📝 Creating {len(tasks)} tasks under {epic_key}...")
-
-    created = []
-    for i, t in enumerate(tasks, 1):
-        try:
-            bot.edit_message_text(f"📝 Creating task {i}/{len(tasks)}...", chat_id, status_msg.message_id)
-        except Exception:
-            pass
-        ticket_data = {
-            "summary": t.get("summary", f"Task {i}"),
-            "description_summary": t.get("task_summary", ""),
-            "user_story": t.get("user_story", ""),
-            "acceptance_criteria": t.get("acceptance_criteria", []),
-            "test_plan": t.get("test_plan", ""),
-            "story_points": t.get("story_points", 1.0),
-            "priority": "Medium",
-        }
-        key = create_ax_ticket(ticket_data, "Task", parent_key=epic_key)
-        if key:
-            created.append({"key": key, "summary": t["summary"], "sp": t.get("story_points", 0)})
-
-    try:
-        bot.delete_message(chat_id, status_msg.message_id)
-    except Exception:
-        pass
-
-    total_sp = sum(c["sp"] for c in created)
-    link = f"https://axiscrm.atlassian.net/browse/{epic_key}"
-    task_list = "\n".join(f"  {c['key']}: {c['summary']} ({c['sp']} SP)" for c in created)
-    bot.send_message(chat_id,
-        f"✅ [{epic_key}]({link}) — {len(created)} tasks created ({total_sp} SP)\n{task_list}\n\n"
-        f"Send another ticket ID, or /done to exit.",
-        parse_mode="Markdown", disable_web_page_preview=True)
-
-    # Clear pm5 state
-    state.pop("pm5_pending", None)
-    state.pop("ticket_key", None)
-    user_mode[chat_id] = state
-    log.info(f"PO PM5: Created {len(created)} tasks under {epic_key} ({total_sp} SP)")
-
-
-def handle_pm5_changes(change_text, chat_id, bot, state, user_mode):
-    """Regenerate PM5 breakdown with change instructions."""
-    pm5 = state.get("pm5_pending")
-    if not pm5:
-        return
-
-    status_msg = bot.send_message(chat_id, "🔄 Regenerating tasks...")
-
-    prompt = f"""You previously generated this task breakdown:
-{json.dumps(pm5['tasks'], indent=2)}
-
-Changes requested: {change_text}
-
-<prd>
-{pm5['prd_content'][:6000]}
-</prd>
-
-Apply changes. SP: 0.25, 0.5, 1, 2, or 3 max. 8-15 tasks.
-JSON only (no fences). Same format as before."""
-
-    response = call_claude(prompt, max_tokens=6000)
-
-    try:
-        bot.delete_message(chat_id, status_msg.message_id)
-    except Exception:
-        pass
-
-    if not response:
-        bot.send_message(chat_id, "❌ Failed to regenerate. Try again.")
-        return
-
-    try:
-        clean = re.sub(r'^```(?:json)?\s*', '', response)
-        clean = re.sub(r'\s*```$', '', clean)
-        tasks = json.loads(clean)
-    except json.JSONDecodeError:
-        bot.send_message(chat_id, "❌ Failed to parse. Try again.")
-        return
-
-    pm5["tasks"] = tasks
-    pm5["total_sp"] = sum(t.get("story_points", 0) for t in tasks)
-
-    lines = [f"📝 *{pm5['epic_key']} — Task Breakdown* ({len(tasks)} tasks, {pm5['total_sp']} SP)\n"]
-    for i, t in enumerate(tasks, 1):
-        lines.append(f"{i}. {t.get('summary', '?')} ({t.get('story_points', '?')} SP)")
-    lines.append(f"\n✅ *approve* | 🔄 describe more changes | ⛔ *cancel*")
-
-    bot.send_message(chat_id, "\n".join(lines), parse_mode="Markdown")
-    user_mode[chat_id] = state
-
-
-def handle_pm7_trigger(ticket_key, chat_id, bot, state, user_mode):
-    """Trigger PM7 sprint scheduling for an Epic — reads source AR idea's Roadmap field."""
-    issue = jira_get(f"/rest/api/3/issue/{ticket_key}", params={
-        "fields": "summary,issuetype,description"
-    })
-    if not issue:
-        bot.send_message(chat_id, f"❌ Couldn't find {ticket_key}.")
-        return
-    itype = issue.get("fields", {}).get("issuetype", {}).get("name", "")
-    if itype != "Epic":
-        bot.send_message(chat_id, f"❌ PM7 only works on Epics. {ticket_key} is a {itype}.")
-        return
-
-    # Find source AR idea from description
-    desc_adf = issue["fields"].get("description") or {}
-    desc_text = adf_to_text(desc_adf) if isinstance(desc_adf, dict) else str(desc_adf)
-    ar_match = re.search(r'(AR-\d+)', desc_text)
-    if not ar_match:
-        bot.send_message(chat_id, f"❌ No source AR idea found in {ticket_key} description.")
-        return
-
-    source_idea_key = ar_match.group(1)
-    status_msg = bot.send_message(chat_id, f"📅 Reading roadmap from {source_idea_key}...")
-
-    # Read AR idea's Roadmap field
-    ar_issue = jira_get(f"/rest/api/3/issue/{source_idea_key}", params={
-        "fields": ROADMAP_FIELD
-    })
-    if not ar_issue:
-        try: bot.delete_message(chat_id, status_msg.message_id)
-        except Exception: pass
-        bot.send_message(chat_id, f"❌ Couldn't fetch {source_idea_key}.")
-        return
-
-    roadmap_field = ar_issue.get("fields", {}).get(ROADMAP_FIELD)
-    if not roadmap_field:
-        try: bot.delete_message(chat_id, status_msg.message_id)
-        except Exception: pass
-        bot.send_message(chat_id, f"⚠️ No Roadmap field set on {source_idea_key}. Set it first, then retry pm7.")
-        return
-
-    roadmap_value = roadmap_field.get("value", "") if isinstance(roadmap_field, dict) else str(roadmap_field)
-    if roadmap_value.lower() in ("backlog", "shipped", "delivered", ""):
-        try: bot.delete_message(chat_id, status_msg.message_id)
-        except Exception: pass
-        bot.send_message(chat_id, f"⚠️ {source_idea_key} Roadmap = '{roadmap_value}' — not a sprint target.")
-        return
-
-    try: bot.delete_message(chat_id, status_msg.message_id)
-    except Exception: pass
-
-    # Use sprint label to move
-    handle_sprint_move(ticket_key, roadmap_value, chat_id, bot)
-    state.pop("ticket_key", None)
-    user_mode[chat_id] = state
-    log.info(f"PO PM7: Triggered sprint scheduling for {ticket_key} via {source_idea_key} Roadmap='{roadmap_value}'")
-
-
 def process_telegram_update(text, chat_id, bot, state, user_mode):
     """Process an update instruction for an existing ticket."""
     ticket_key = state.get("ticket_key")
     instruction = text
 
-    # ── PM5 approval flow (pending task breakdown) ──
-    if state.get("pm5_pending"):
-        lower = text.strip().lower()
-        if lower in ("approve", "yes", "go", "create", "ok"):
-            handle_pm5_approval(chat_id, bot, state, user_mode)
-            return
-        elif lower in ("cancel", "abort", "no", "stop"):
-            epic_key = state["pm5_pending"]["epic_key"]
-            state.pop("pm5_pending", None)
-            state.pop("ticket_key", None)
-            user_mode[chat_id] = state
-            bot.send_message(chat_id, f"⛔ {epic_key} task breakdown cancelled.\n\nSend another ticket ID, or /done to exit.")
-            return
-        else:
-            # Treat as change instructions
-            handle_pm5_changes(text, chat_id, bot, state, user_mode)
-            return
-
-    # ── Extract ticket key if not yet set ──
+    # If no ticket key yet, try to extract from this message
     if not ticket_key:
         ticket_key, instruction = extract_ticket_key(text)
         if not ticket_key:
-            bot.send_message(chat_id, "❓ Send a ticket ID (e.g. `AX-426`).", parse_mode="Markdown")
+            bot.send_message(chat_id, "❓ I need a ticket ID (e.g. AX-123). Send the ticket ID and what to change.")
             return
         state["ticket_key"] = ticket_key
         user_mode[chat_id] = state
 
-    # ── No instruction yet: show ticket and wait ──
+    # If we have a key but no instruction, ask for it
     if not instruction:
+        # Fetch and show current ticket
         bot.send_message(chat_id, f"🔍 Loading {ticket_key}...")
         issue = jira_get(f"/rest/api/3/issue/{ticket_key}", params={
-            "fields": f"summary,issuetype,status,{STORY_POINTS_FIELD},description,sprint"
+            "fields": f"summary,issuetype,status,{STORY_POINTS_FIELD},description"
         })
         if not issue or "fields" not in issue:
             bot.send_message(chat_id, f"❌ Couldn't find {ticket_key}. Check the ticket ID.")
@@ -2450,44 +2006,15 @@ def process_telegram_update(text, chat_id, bot, state, user_mode):
         itype = f.get("issuetype", {}).get("name", "?")
         status = f.get("status", {}).get("name", "?")
         sp = f.get(STORY_POINTS_FIELD) or "—"
-        sprint_info = ""
-        sprints = f.get("sprint") or f.get("customfield_10020") or []
-        if isinstance(sprints, list) and sprints:
-            sprint_info = f" · {sprints[-1].get('name', '?')}"
-        elif isinstance(sprints, dict):
-            sprint_info = f" · {sprints.get('name', '?')}"
 
         bot.send_message(chat_id,
-            f"✏️ *{ticket_key}* ({itype} · {status}{sprint_info})\n"
+            f"✏️ *{ticket_key}* ({itype} · {status} · {sp} SP)\n"
             f"_{summary}_\n\n"
-            f"What do you want to do?",
+            f"What do you want to change?",
             parse_mode="Markdown")
         return
 
-    # ── Detect PO actions ──
-    action, param = detect_update_action(instruction)
-
-    if action == "sprint":
-        handle_sprint_move(ticket_key, param, chat_id, bot)
-        state.pop("ticket_key", None)
-        user_mode[chat_id] = state
-        return
-
-    if action == "backlog":
-        handle_backlog_move(ticket_key, chat_id, bot)
-        state.pop("ticket_key", None)
-        user_mode[chat_id] = state
-        return
-
-    if action == "pm5":
-        handle_pm5_trigger(ticket_key, chat_id, bot, state, user_mode)
-        return
-
-    if action == "pm7":
-        handle_pm7_trigger(ticket_key, chat_id, bot, state, user_mode)
-        return
-
-    # ── Fall through to AI-powered field update ──
+    # We have both key and instruction — process
     bot.send_message(chat_id, f"✏️ Updating {ticket_key}...")
 
     issue = jira_get(f"/rest/api/3/issue/{ticket_key}", params={
