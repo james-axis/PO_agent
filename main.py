@@ -899,23 +899,17 @@ def build_enrichment_prompt(issue, linked_content, confluence_context, issue_typ
     if confluence_context:
         ctx += f"\nRELATED CONFLUENCE PAGES:\n{confluence_context}\n"
 
-    base = f"""You are a senior Product Manager for Axis CRM, a life insurance distribution CRM platform.
-The platform is used by AFSL-licensed insurance advisers to manage clients, policies, applications, quotes, payments and commissions.
-Partner insurers include TAL, Zurich, AIA, MLC Life, MetLife, Resolution Life, Integrity Life and others.
-The CRM serves multiple divisions: LIP (lead intake & processing) team, services team, and advisers.
-
-You are enriching a Jira {issue_type} ticket. Fill in ONLY the Product Manager section.
-Leave Engineer section fields empty — engineers fill those during refinement.
+    base = f"""You are a PM for Axis CRM (life insurance distribution CRM for AFSL-licensed advisers).
+Enriching a Jira {issue_type} ticket. Fill PM section only — leave Engineer fields empty.
 
 TICKET: {issue["key"]}
-CURRENT SUMMARY: {summary}
+SUMMARY: {summary}
 PARENT EPIC: {parent_summary or 'None'}
-PRIORITY: {priority}
-STATUS: {status}
-CURRENT STORY POINTS: {sp or 'Not set'}
-EXISTING DESCRIPTION:
+PRIORITY: {priority} | STATUS: {status} | SP: {sp or 'Not set'}
+DESCRIPTION:
 {clean_desc}
 {ctx}
+BE CONCISE throughout — short sentences, no filler.
 """
 
     if issue_type == "Epic":
@@ -936,21 +930,21 @@ RESPOND IN EXACTLY THIS JSON FORMAT (no markdown fences):
     elif issue_type == "Task":
         base += f"""
 RULES:
-- polished_summary MUST be user story format: "As a [role], I want [action], so that [benefit]"
-- Estimate story points: 1 (~2hrs), 2 (~4hrs), 3 (~1 day). Max 3 per ticket.
-- If work exceeds 3 story points, set needs_split=true and provide split_tasks.
-- Each split task must be independently shippable, <=3 story points, user story format.
-- Current story points: {sp or 'Not set'}. If already set and <=3, keep them.
+- polished_summary: user story format "As a [role], I want [action], so that [benefit]"
+- SP: 1 (~2hrs), 2 (~4hrs), 3 (~1 day). Max 3. If >3, set needs_split=true.
+- acceptance_criteria: 2-4 short, testable items
+- test_plan: brief numbered steps
+- Current SP: {sp or 'Not set'}. Keep if already set and <=3.
 
-RESPOND IN EXACTLY THIS JSON FORMAT (no markdown fences):
+JSON only (no fences):
 {{
-  "polished_summary": "<user story format>",
-  "pm_summary": "<1-2 sentence summary>",
+  "polished_summary": "<user story>",
+  "pm_summary": "<1 sentence>",
   "user_story": "<As a [role], I want [action], so that [benefit]>",
-  "acceptance_criteria": ["<criterion 1>", "<criterion 2>"],
+  "acceptance_criteria": ["<short AC>", "<short AC>"],
   "test_plan": "1. <step>\\n2. <step>",
   "story_points": <1-3>,
-  "needs_split": <true or false>,
+  "needs_split": <true|false>,
   "split_tasks": [
     {{"summary": "<user story>", "story_points": <1-3>, "acceptance_criteria": ["..."]}}
   ]
@@ -958,14 +952,12 @@ RESPOND IN EXACTLY THIS JSON FORMAT (no markdown fences):
     elif issue_type == "Bug":
         base += f"""
 RULES:
-- polished_summary should clearly describe the bug.
-- Estimate story points: 1 (~2hrs), 2 (~4hrs), 3 (~1 day). Max 3.
-- If fix exceeds 3 story points, set needs_split=true.
+- SP: 1 (~2hrs), 2 (~4hrs), 3 (~1 day). Max 3. If >3, set needs_split=true.
 
-RESPOND IN EXACTLY THIS JSON FORMAT (no markdown fences):
+JSON only (no fences):
 {{
   "polished_summary": "<clear bug description>",
-  "pm_summary": "<expected vs actual behaviour, impact>",
+  "pm_summary": "<expected vs actual, 1 sentence>",
   "story_points": <1-3>,
   "needs_split": false,
   "split_tasks": []
@@ -973,13 +965,12 @@ RESPOND IN EXACTLY THIS JSON FORMAT (no markdown fences):
     elif issue_type == "Maintenance":
         base += f"""
 RULES:
-- polished_summary should describe the maintenance work clearly.
-- Estimate story points: 1 (~2hrs), 2 (~4hrs), 3 (~1 day). Max 3.
+- SP: 1 (~2hrs), 2 (~4hrs), 3 (~1 day). Max 3.
 
-RESPOND IN EXACTLY THIS JSON FORMAT (no markdown fences):
+JSON only (no fences):
 {{
   "polished_summary": "<maintenance description>",
-  "pm_summary": "<what maintenance is needed and why>",
+  "pm_summary": "<what and why, 1 sentence>",
   "story_points": <1-3>,
   "needs_split": false,
   "split_tasks": []
@@ -987,13 +978,13 @@ RESPOND IN EXACTLY THIS JSON FORMAT (no markdown fences):
     elif issue_type == "Spike":
         base += f"""
 RULES:
-- polished_summary should frame the investigation question.
-- Spikes are timeboxed. Estimate story points: 1 (~2hrs), 2 (~4hrs), 3 (~1 day). Max 3.
+- polished_summary: frame as investigation question.
+- SP: 1 (~2hrs), 2 (~4hrs), 3 (~1 day). Max 3.
 
-RESPOND IN EXACTLY THIS JSON FORMAT (no markdown fences):
+JSON only (no fences):
 {{
   "polished_summary": "<investigation question>",
-  "pm_summary": "<what needs investigating, what decision it informs>",
+  "pm_summary": "<what to investigate, what decision it informs, 1 sentence>",
   "story_points": <1-3>,
   "needs_split": false,
   "split_tasks": []
@@ -1001,13 +992,12 @@ RESPOND IN EXACTLY THIS JSON FORMAT (no markdown fences):
     elif issue_type == "Support":
         base += f"""
 RULES:
-- polished_summary should describe the support request clearly.
-- Estimate story points: 1 (~2hrs), 2 (~4hrs), 3 (~1 day). Max 3.
+- SP: 1 (~2hrs), 2 (~4hrs), 3 (~1 day). Max 3.
 
-RESPOND IN EXACTLY THIS JSON FORMAT (no markdown fences):
+JSON only (no fences):
 {{
-  "polished_summary": "<support request description>",
-  "pm_summary": "<what the stakeholder needs and why>",
+  "polished_summary": "<support request>",
+  "pm_summary": "<what's needed and why, 1 sentence>",
   "story_points": <1-3>,
   "needs_split": false,
   "split_tasks": []
@@ -1342,36 +1332,29 @@ def build_idea_extraction_prompt(user_text):
     product_cats = ", ".join(f'"{k.title()}"' for k in PRODUCT_CATEGORY_OPTIONS)
     initiative_modules = ", ".join(f'"{k.title()}"' for k in INITIATIVE_OPTIONS)
 
-    return f"""You are a senior Product Manager for Axis CRM, a life insurance distribution CRM platform.
-The platform is used by AFSL-licensed insurance advisers to manage clients, policies, applications, quotes, payments and commissions.
-Partner insurers include TAL, Zurich, AIA, MLC Life, MetLife, Resolution Life, Integrity Life and others.
-
-A product idea has been submitted via Telegram (possibly from a voice note transcription — it may be informal/conversational).
-Your job is to extract and structure it into a fully-formed JPD idea.
+    return f"""You are a PM for Axis CRM (life insurance distribution CRM for AFSL-licensed advisers).
+Structure this Telegram message into a JPD idea. Be concise — every section 1-2 sentences max.
 
 USER INPUT:
 {user_text}
 
-Respond with ONLY a JSON object (no markdown, no backticks, no explanation):
+JSON only (no markdown, no backticks):
 
 {{
-  "summary": "Concise idea title (3-8 words)",
-  "description": "**Outcome we want to achieve**\\n\\n[Clear, specific outcome with measurable targets where possible.]\\n\\n**Why it's a problem**\\n\\n[Current pain point, inefficiency, or gap. Include evidence where available.]\\n\\n**How it gets us closer to our vision: The Adviser CRM that enables workflow and pipeline visibility, client engagement and compliance through intelligent automation.**\\n\\n[Connect to vision — workflow/pipeline visibility, client engagement, compliance, or intelligent automation.]\\n\\n**How it improves our north star: Total submissions**\\n\\n[Specific causal chain explaining how this increases total submissions.]",
-  "swimlane": "[Experience, Capability, or Other]",
-  "initiative": "[Primary module — select ONE from: {initiative_modules}]",
-  "phase": "[MVP or Iteration]",
+  "summary": "Concise title (3-6 words)",
+  "description": "**Outcome**\\n\\n[1-2 sentences: what success looks like]\\n\\n**Problem**\\n\\n[1-2 sentences: current pain point]\\n\\n**Vision alignment**\\n\\n[1 sentence: how it enables workflow visibility, client engagement, compliance, or automation]\\n\\n**North star impact**\\n\\n[1 sentence: how it increases total submissions]",
+  "swimlane": "[Experience|Capability|Other]",
+  "initiative": "[ONE from: {initiative_modules}]",
+  "phase": "[MVP|Iteration]",
   "product_category": "[One of: {product_cats}, or null]",
   "discovery": "Validate"
 }}
 
 RULES:
-- Write the description as a thoughtful PM would — substantive, not just parroting the input.
-- The four description sections are MANDATORY. Fill them all in based on the context.
-- swimlane: "Experience" = adviser-facing screens, dashboards, forms, UI flows. "Capability" = backend automation, integrations, data pipelines, APIs, system infrastructure. "Other" = anything that doesn't clearly fit.
-- initiative must be ONE value from the list. Pick the closest match.
-- phase: "MVP" = building something new that doesn't exist yet. "Iteration" = improving or extending something already in the platform.
-- ROADMAP: Do NOT include a roadmap_column field. All new ideas go to Backlog automatically.
-- discovery should default to "Validate" unless the user says otherwise."""
+- Be direct and specific. No filler.
+- swimlane: Experience = user-facing UI/UX. Capability = backend/system/infra. Other = neither.
+- phase: MVP = net new. Iteration = improving existing.
+- discovery defaults to "Validate"."""
 
 
 def create_jpd_idea(structured_data):
@@ -1844,60 +1827,38 @@ AX_DESCRIPTION_TEMPLATES["Spike"] = AX_DESCRIPTION_TEMPLATES["Bug"]
 
 def build_work_breakdown_prompt(user_text):
     """Build the Claude prompt to structure a Telegram message into an AX Epic + child tickets."""
-    return f"""You are a senior Product Manager for Axis CRM, a life insurance distribution CRM platform.
-The platform is used by AFSL-licensed insurance advisers to manage clients, policies, applications, quotes, payments and commissions.
-Partner insurers include TAL, Zurich, AIA, MLC Life, MetLife, Resolution Life, Integrity Life and others.
-The CRM serves multiple divisions: LIP (lead intake & processing) team, services team, and advisers.
-
-A product requirement has been submitted via Telegram (possibly from a voice note transcription — it may be informal).
-Your job is to:
-1. Create an Epic that captures the overall initiative
-2. Break it down into individual shippable tickets (Task, Bug, Spike, Support, Maintenance)
-3. Each ticket must be <=3 story points (3pts = 6hrs, 2pts = 4hrs, 1pt = 2hrs, 0.5pt = 1hr, 0.25pt = 30min)
+    return f"""Break this into an Epic + child tickets for Axis CRM (life insurance distribution CRM).
 
 USER INPUT:
 {user_text}
 
-Respond with ONLY a JSON object (no markdown, no backticks, no explanation):
+JSON only (no markdown, no backticks):
 
 {{
   "epic": {{
-    "summary": "Concise epic title",
-    "description_summary": "One paragraph describing the epic scope and goals",
+    "summary": "Short epic title",
+    "description_summary": "1-2 sentences: scope and goal",
     "priority": "Medium"
   }},
   "tickets": [
     {{
       "type": "Task",
-      "summary": "Clear task summary as a user story where appropriate",
+      "summary": "User story or clear title",
       "priority": "Medium",
       "story_points": 2,
       "user_story": "As a [user], I want [goal] so that [benefit]",
-      "acceptance_criteria": ["Criterion 1", "Criterion 2"],
-      "test_plan": ["Test step 1", "Test step 2"]
-    }},
-    {{
-      "type": "Spike",
-      "summary": "Investigation: [what needs investigating]",
-      "priority": "High",
-      "story_points": 1,
-      "investigation_summary": "Brief description of what to investigate"
+      "acceptance_criteria": ["Short AC 1", "Short AC 2"],
+      "test_plan": ["Step 1", "Step 2"]
     }}
   ]
 }}
 
 RULES:
-- ALWAYS create at least 2 tickets under the epic.
-- Ticket types: Task, Bug, Spike, Support, Maintenance. Choose the most appropriate for each piece of work.
-- Tasks MUST include user_story, acceptance_criteria (array), and test_plan (array).
-- Bug, Spike, Support only need summary and investigation_summary.
-- Maintenance only needs summary.
-- NO ticket can exceed 3 story points. If work is large, split into multiple tickets.
-- story_points must be one of: 0.25, 0.5, 1, 2, 3.
-- Priority: choose from Lowest, Low, Medium, High, Highest based on urgency/impact.
-- Epic priority should reflect the overall importance.
-- Write substantive descriptions — don't just parrot the input.
-- Think about what a developer actually needs to build this."""
+- Min 2 tickets. Types: Task, Bug, Spike, Support, Maintenance.
+- SP: 0.25, 0.5, 1, 2, 3. Max 3 — split if larger.
+- Tasks: include user_story, acceptance_criteria, test_plan (all concise).
+- Bug/Spike/Support: summary + investigation_summary (1 sentence).
+- Keep everything short and specific. No filler."""
 
 
 def create_ax_ticket(ticket_data, issue_type, parent_key=None):
@@ -1989,37 +1950,29 @@ def extract_ticket_key(text):
 
 def build_update_prompt(issue_key, issue_type, current_summary, current_desc_text, current_sp, user_instruction):
     """Build Claude prompt to interpret update instructions."""
-    return f"""You are a senior Product Manager for Axis CRM, a life insurance distribution CRM platform.
+    return f"""Apply an update to this Jira ticket based on the instruction.
 
-You need to apply an update to an existing Jira ticket based on the user's instruction.
-
-CURRENT TICKET:
-- Key: {issue_key}
-- Type: {issue_type}
-- Summary: {current_summary}
-- Story Points: {current_sp}
-- Current Description:
+TICKET: {issue_key} ({issue_type})
+Summary: {current_summary} | SP: {current_sp}
+Description:
 {current_desc_text}
 
-USER INSTRUCTION:
-{user_instruction}
+INSTRUCTION: {user_instruction}
 
-Respond with ONLY a JSON object (no markdown, no backticks):
+JSON only (no fences):
 
 {{
-  "summary": "Updated summary (or null to keep current)",
+  "summary": "Updated summary or null",
   "story_points": null,
-  "description_changes": "A clear description of what sections to update and the new content. Be specific about which PM/Engineer sections to modify. Set to null if no description changes.",
-  "updated_description": "The FULL updated description in markdown if changes are needed (preserving the existing template structure and all sections). Set to null if no description changes."
+  "description_changes": "What to change, or null",
+  "updated_description": "FULL updated description in markdown preserving template structure, or null"
 }}
 
 RULES:
-- Only change what the user asked for. Preserve everything else exactly.
-- If the user mentions story points or SP, update story_points (must be 0.25, 0.5, 1, 2, or 3).
-- If the user mentions summary/title, update summary.
-- For description changes, always preserve the PM/Engineer section structure and DoR/DoD links.
-- Be thoughtful — a brief instruction like "add admin validation to AC" means add it to existing acceptance criteria, not replace them.
-- Set fields to null if they shouldn't change."""
+- Only change what's asked. Preserve everything else.
+- SP must be 0.25, 0.5, 1, 2, or 3. Set null if unchanged.
+- Preserve PM/Engineer sections and DoR/DoD links.
+- Be concise in all content."""
 
 
 def process_telegram_update(text, chat_id, bot, state, user_mode):
@@ -2137,45 +2090,33 @@ def process_telegram_update(text, chat_id, bot, state, user_mode):
 
 def build_add_prompt(epic_key, epic_summary, user_instruction):
     """Build Claude prompt to create child tickets under an epic."""
-    return f"""You are a senior Product Manager for Axis CRM, a life insurance distribution CRM platform.
-The platform is used by AFSL-licensed insurance advisers to manage clients, policies, applications, quotes, payments and commissions.
-Partner insurers include TAL, Zurich, AIA, MLC Life, MetLife, Resolution Life, Integrity Life and others.
+    return f"""Create child ticket(s) under this epic.
 
-You need to create one or more child tickets under an existing epic based on the user's description.
+EPIC: {epic_key} — {epic_summary}
 
-PARENT EPIC:
-- Key: {epic_key}
-- Summary: {epic_summary}
+REQUEST: {user_instruction}
 
-USER REQUEST:
-{user_instruction}
-
-Respond with ONLY a JSON object (no markdown, no backticks):
+JSON only (no fences):
 
 {{
   "tickets": [
     {{
       "type": "Task",
-      "summary": "Clear task summary",
+      "summary": "Short clear title",
       "priority": "Medium",
       "story_points": 2,
       "user_story": "As a [user], I want [goal] so that [benefit]",
-      "acceptance_criteria": ["Criterion 1", "Criterion 2"],
-      "test_plan": ["Test step 1", "Test step 2"]
+      "acceptance_criteria": ["Short AC 1", "Short AC 2"],
+      "test_plan": ["Step 1", "Step 2"]
     }}
   ]
 }}
 
 RULES:
-- Ticket types: Task, Bug, Spike, Support, Maintenance. Choose the most appropriate.
-- Tasks MUST include user_story, acceptance_criteria (array), and test_plan (array).
-- Bug, Spike, Support only need summary and investigation_summary.
-- Maintenance only needs summary.
-- NO ticket can exceed 3 story points (3pts = 6hrs, 2pts = 4hrs, 1pt = 2hrs, 0.5pt = 1hr, 0.25pt = 30min).
-- If the user describes one ticket, create one. If they describe multiple, create multiple.
-- story_points must be one of: 0.25, 0.5, 1, 2, 3.
-- Priority: choose from Lowest, Low, Medium, High, Highest.
-- Write substantive descriptions — don't just parrot the input."""
+- Types: Task, Bug, Spike, Support, Maintenance.
+- Tasks: user_story + acceptance_criteria + test_plan (all concise).
+- Bug/Spike/Support: summary + investigation_summary (1 sentence).
+- SP: 0.25, 0.5, 1, 2, 3. Max 3. Keep everything brief."""
 
 
 def process_telegram_add(text, chat_id, bot, state, user_mode):
@@ -2725,48 +2666,33 @@ def build_decomposition_prompt(issue, linked_content, confluence_context):
     if confluence_context:
         ctx += f"\nRELATED CONFLUENCE PAGES:\n{confluence_context}\n"
 
-    return f"""You are a senior Software Engineering Lead at Axis CRM, a life insurance distribution CRM platform.
-The platform is built with Django/Python, used by AFSL-licensed insurance advisers to manage clients, policies, applications, quotes, payments and commissions.
-Partner insurers include TAL, Zurich, AIA, MLC Life, MetLife, Resolution Life, Integrity Life and others.
+    return f"""Split this Jira {issue_type} into the smallest independently shippable tickets.
 
-You are splitting a Jira {issue_type} ticket into the SMALLEST possible independent tickets for smooth sprint burndown.
-The goal is: each new ticket = one atomic commit/PR that can be reviewed, merged and shipped independently.
-We want the burndown chart to look smooth and close to the ideal line — no large stepped drops.
-
-TICKET: {issue["key"]}
-SUMMARY: {summary}
-PARENT EPIC: {parent_summary or 'None'}
-PRIORITY: {priority}
-CURRENT STORY POINTS: {sp}
-TYPE: {issue_type}
-DESCRIPTION:
+TICKET: {issue["key"]} ({issue_type})
+Summary: {summary} | SP: {sp} | Priority: {priority}
+Epic: {parent_summary or 'None'}
+Description:
 {clean_desc}
 {ctx}
 
 RULES:
-- Split into tickets of 0.5 or 1 story points each. 0.5 = ~1 hour of work, 1 = ~2 hours.
-- Each ticket MUST be independently shippable — a single commit/PR that compiles, passes tests and doesn't break the codebase.
-- Order tickets in logical implementation sequence (e.g., model/migration first → backend logic → API/views → templates/UI → tests/docs).
-- Think about what an engineer would actually commit separately: a migration, a new model field, view logic, a template change, admin config, permission changes, tests.
-- For this Django CRM: consider separating model/migration, view/URL, template/CSS, admin config, permission, test, and documentation changes.
-- Summaries should be specific and actionable (e.g., "Add can_view_calls field to UserRole model + migration" not "Update model").
-- Each ticket needs 1-3 clear acceptance criteria.
-- The sum of all ticket story points should equal or be close to the original {sp} SP.
-- Minimum 2 tickets, no maximum but be practical.
-- Do NOT include test-only tickets unless the testing is substantial (>1hr). Instead, include relevant tests within each ticket's scope.
-- For {issue_type} type tickets, write summaries as actionable engineering tasks.
+- 0.5 SP (~1hr) or 1 SP (~2hr) per ticket. Sum should ≈ original {sp} SP.
+- Each ticket = one atomic PR that compiles and ships independently.
+- Order: model/migration → backend logic → API/views → templates/UI.
+- Specific actionable summaries. 1-2 short acceptance criteria each.
+- Min 2 tickets. No test-only tickets unless substantial.
 
-RESPOND IN EXACTLY THIS JSON FORMAT (no markdown fences):
+JSON only (no fences):
 {{
   "split_tickets": [
     {{
-      "summary": "<specific actionable ticket title>",
+      "summary": "<specific actionable title>",
       "story_points": <0.5 or 1>,
-      "acceptance_criteria": ["<criterion 1>", "<criterion 2>"],
+      "acceptance_criteria": ["<short AC>"],
       "sequence": <1, 2, 3...>
     }}
   ],
-  "decomposition_rationale": "<1 sentence explaining why this breakdown makes sense>"
+  "decomposition_rationale": "<1 sentence>"
 }}"""
 
 
@@ -3027,58 +2953,38 @@ def build_delivery_epic_prompt(idea):
     if isinstance(desc, dict):
         desc = adf_to_text(desc)
 
-    return f"""You are a senior Product Manager for Axis CRM, a life insurance distribution CRM platform.
-The platform is used by AFSL-licensed insurance advisers to manage clients, policies, applications, quotes, payments and commissions.
-Partner insurers include TAL, Zurich, AIA, MLC Life, MetLife, Resolution Life, Integrity Life and others.
-The CRM serves multiple divisions: LIP (lead intake & processing) team, services team, and advisers.
+    return f"""Create a delivery Epic + child tickets from this roadmap idea.
 
-You are creating a delivery Epic in the AX (Sprints) project from a strategic initiative idea.
-
-SOURCE IDEA: {idea["key"]}
-SUMMARY: {summary}
+SOURCE: {idea["key"]} — {summary}
 DESCRIPTION:
 {desc[:4000]}
 
-Create a delivery Epic and break it into shippable tickets.
-
-Respond with ONLY a JSON object (no markdown, no backticks):
+JSON only (no fences):
 
 {{
   "epic": {{
-    "summary": "Implementation-focused epic title (different from idea title)",
-    "description_summary": "One paragraph: what will be built and expected outcome",
+    "summary": "Implementation-focused title (not a copy of idea title)",
+    "description_summary": "1-2 sentences: what's built and expected outcome",
     "priority": "Medium"
   }},
   "tickets": [
     {{
       "type": "Task",
-      "summary": "Clear task summary",
+      "summary": "Short clear title",
       "priority": "Medium",
       "story_points": 2,
       "user_story": "As a [user], I want [goal] so that [benefit]",
-      "acceptance_criteria": ["Criterion 1", "Criterion 2"],
-      "test_plan": ["Test step 1", "Test step 2"]
-    }},
-    {{
-      "type": "Spike",
-      "summary": "Investigation: [what]",
-      "priority": "High",
-      "story_points": 1,
-      "investigation_summary": "What to investigate"
+      "acceptance_criteria": ["Short AC 1", "Short AC 2"],
+      "test_plan": ["Step 1", "Step 2"]
     }}
   ]
 }}
 
 RULES:
-- At least 2 tickets under the epic.
-- Epic summary must be implementation-focused, NOT a copy of the idea title.
-- Types: Task, Bug, Spike, Support, Maintenance.
-- Tasks MUST include user_story, acceptance_criteria (array), test_plan (array).
-- Bug/Spike/Support need summary + investigation_summary. Maintenance just summary.
-- Max 3 story points per ticket (3=6hrs, 2=4hrs, 1=2hrs, 0.5=1hr, 0.25=30min).
-- story_points: 0.25, 0.5, 1, 2, or 3.
-- Priority: Lowest, Low, Medium, High, Highest.
-- Write substantive descriptions a developer can act on."""
+- Min 2 tickets. Types: Task, Bug, Spike, Support, Maintenance.
+- Tasks: user_story + acceptance_criteria + test_plan (all concise).
+- Bug/Spike/Support: summary + investigation_summary (1 sentence).
+- SP: 0.25, 0.5, 1, 2, 3. Max 3. Keep everything brief."""
 
 
 def link_idea_to_epic(idea_key, epic_key):
@@ -3618,25 +3524,11 @@ Start: {next_sp['start'][:10] if next_sp['start'] else 'N/A'} → End: {next_sp[
 Tickets ({len(next_sp['issues'])}):
 {next_issues}"""
 
-    return f"""You are preparing the weekly product meeting notes for Axis CRM.
-Axis CRM is a life insurance distribution CRM platform built with Django/Python, used by AFSL-licensed insurance advisers.
+    return f"""Generate weekly product meeting notes for Axis CRM.
 
-Generate two things:
+1. SPRINT_GOAL: One line with emoji indicator (🟢 on track / 🟡 minor risks / 🔴 blocked) + brief goal.
 
-1. SPRINT_GOAL: A concise one-line sprint goal using an emoji colour indicator and a brief description.
-Use these emoji indicators:
-- 🟢 On track / healthy
-- 🟡 Minor risks / slightly behind
-- 🔴 Blocked / significantly behind
-Example: "🟢 Complete payments dashboard v1.1 and begin adviser payments view."
-
-2. INSIGHTS: A 2-3 paragraph progress summary covering:
-- What was completed this sprint (key deliverables)
-- What's currently in progress
-- What's coming in the next sprint
-- Any notable patterns or risks
-
-Keep it professional but conversational — this is for a leadership audience.
+2. INSIGHTS: 2-3 short paragraphs — what's done, in progress, coming next, any risks. Keep it tight.
 
 {active_summary}
 
@@ -3644,10 +3536,10 @@ Keep it professional but conversational — this is for a leadership audience.
 
 Previous meeting: {last_page_title}
 
-RESPOND IN EXACTLY THIS JSON FORMAT (no markdown fences):
+JSON only (no fences):
 {{
   "sprint_goal": "<emoji + one-line goal>",
-  "insights": "<2-3 paragraph summary>"
+  "insights": "<2-3 short paragraphs>"
 }}"""
 
 
