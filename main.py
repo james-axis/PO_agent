@@ -1769,6 +1769,10 @@ def start_telegram_bot():
         else:
             process_telegram_idea(message.text, message.chat.id, bot)
 
+    # Register automated action commands (sprint approval, etc.)
+    from po_actions_automatic import register_commands
+    register_commands(bot)
+
     log.info("JOB 7: Telegram bot starting (polling)...")
     try:
         bot.infinity_polling(timeout=20, long_polling_timeout=20)
@@ -3751,11 +3755,12 @@ def run():
     log.info("=== Starting Jira prioritisation run ===")
     try:
         log.info("JOB 0: Sprint Lifecycle")
-        manage_sprint_lifecycle()
+        from po_actions_automatic import check_sprint_lifecycle
+        check_sprint_lifecycle()
 
         log.info("JOB 1: Sprint Runway")
         future_sprints = get_future_sprints()
-        future_sprints = ensure_sprint_runway(future_sprints, required=8)
+        future_sprints = ensure_sprint_runway(future_sprints, required=12)
 
         log.info("JOB 15: Strategic Pipeline")
         process_strategic_pipeline()
