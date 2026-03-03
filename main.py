@@ -1912,7 +1912,7 @@ def create_ax_ticket(ticket_data, issue_type, parent_key=None):
 
     # Epic color
     if issue_type == "Epic":
-        fields[ISSUE_COLOR_FIELD] = random.choice(EPIC_COLORS)
+        fields[ISSUE_COLOR_FIELD] = "blue_gray"  # lighter grey
 
     # Story points (not for Epics)
     if story_points and issue_type != "Epic":
@@ -3127,7 +3127,7 @@ def process_strategic_pipeline():
             "description": {"version": 1, "type": "doc", "content": markdown_to_adf(epic_desc_md)},
             "assignee": {"accountId": ANDREJ_ID},
             "priority": {"name": epic_data.get("priority", "Medium")},
-            ISSUE_COLOR_FIELD: random.choice(EPIC_COLORS),
+            ISSUE_COLOR_FIELD: "blue_gray",  # lighter grey
         }
 
         ok, resp = jira_post("/rest/api/3/issue", {"fields": epic_fields})
